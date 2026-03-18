@@ -1,0 +1,42 @@
+{
+  "split": "train",
+  "n_samples": 1000,
+  "config": {
+    "map_size_m": 10.0,
+    "grid_size": 64,
+    "robot_radius": 0.1,
+    "safety_margin": 0.03,
+    "dt": 0.1,
+    "horizon": 64,
+    "v_max": 1.5,
+    "w_max": 1.5,
+    "a_v": 2.0,
+    "a_w": 4.0,
+    "goal_pos_tol": 0.2,
+    "goal_theta_tol_deg": 18.0,
+    "min_start_goal_dist": 3.0,
+    "max_start_goal_dist": 7.0,
+    "min_clearance_start_goal": 0.25,
+    "reject_easy_if_line_clearer_than": 0.9,
+    "max_attempts_per_sample": 20,
+    "out_dir": "diffdrive_fast_dataset",
+    "n_train": 1000,
+    "n_val": 200,
+    "n_test": 100,
+    "seed": 7,
+    "p_open": 0.08,
+    "p_clutter": 0.42,
+    "p_corridor": 0.18,
+    "p_doorway": 0.2,
+    "p_parking": 0.12
+  },
+  "scenario_hist": {
+    "clutter": 368,
+    "parking": 109,
+    "corridor": 345,
+    "doorway": 121,
+    "open": 57
+  },
+  "attempts": 1522,
+  "acceptance_rate": 0.657030223390276
+}
