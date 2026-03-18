@@ -1,13 +1,12 @@
+#Function to run the tests for various environments
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import glob
 import json
 import math
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, List
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,41 +15,31 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-# ============================================================
-# Config
-# ============================================================
-
+#Configurations
 @dataclass
 class InferConfig:
     checkpoint_path: str = "checkpoints/diffdrive_kinodynamic_best.pt"
     data_root: str = "diffdrive_dataset"
     split: str = "test"
 
-    map_mode: str = "sdf"   # must match training: "sdf", "occupancy", or "sdf_occupancy"
+    map_mode: str = "sdf"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Whole-test-set evaluation
-    planner_mode: str = "all"   # "all", "diffusion_only", "diffusion_projected", "cem", "mppi"
-    max_test_files: Optional[int] = None   # None => evaluate all files
+    planner_mode: str = "all"   
+    max_test_files: Optional[int] = None   
     random_seed: int = 0
-
-    # Diffusion candidate count per test instance
     num_samples: int = 64
 
-    # Output
     out_dir: str = "inference_outputs_full_eval"
     save_example_plots: bool = True
     example_plot_count: int = 20
     print_controls_head: int = 10
 
-    # --- test-time projection ---
     project_every: int = 10
     proj_steps: int = 6
     proj_lr: float = 0.06
     proj_lambda: float = 0.1
-    project_last_n_steps: int = 0
-    final_proj_steps: int = 0
+    project_last_n_steps: int = 12
+    final_proj_steps: int = 12
     final_proj_lr: float = 0.03
     final_proj_lambda: float = 0.5
     final_proj_goal_pos_scale: float = 2.0
@@ -58,17 +47,14 @@ class InferConfig:
     control_clip_norm: float = 1.0
     safety_margin_m: float = 0.05
 
-    # shared planning cost weights
     w_goal_pos: float = 25.0
     w_goal_theta: float = 2.0
     w_obs: float = 400.0
     w_ctrl: float = 1e-3
     w_smooth: float = 0.02
 
-    # DDPM x0 clipping
     eta_clip: float = 1.5
 
-    # --- CEM baseline ---
     cem_population: int = 256
     cem_iters: int = 8
     cem_elite_frac: float = 0.1
@@ -76,7 +62,6 @@ class InferConfig:
     cem_init_std_norm: float = 0.75
     cem_min_std_norm: float = 0.05
 
-    # --- MPPI baseline ---
     mppi_population: int = 256
     mppi_iters: int = 10
     mppi_temperature: float = 1.0
@@ -84,24 +69,18 @@ class InferConfig:
     mppi_sigma_w_norm: float = 0.35
 
 
-# ============================================================
-# Utilities
-# ============================================================
-
+#Utility functions needed
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def wrap_angle_torch(theta: torch.Tensor) -> torch.Tensor:
     return (theta + math.pi) % (2.0 * math.pi) - math.pi
 
-
 def angle_diff_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return wrap_angle_torch(a - b)
-
 
 def pose_condition(start: np.ndarray, goal: np.ndarray, map_size_m: float) -> np.ndarray:
     sx = 2.0 * (start[0] / map_size_m) - 1.0
@@ -110,7 +89,6 @@ def pose_condition(start: np.ndarray, goal: np.ndarray, map_size_m: float) -> np
     gy = 2.0 * (goal[1] / map_size_m) - 1.0
     sth = float(start[2])
     gth = float(goal[2])
-
     return np.asarray(
         [
             sx, sy, math.cos(sth), math.sin(sth),
@@ -119,40 +97,32 @@ def pose_condition(start: np.ndarray, goal: np.ndarray, map_size_m: float) -> np
         dtype=np.float32,
     )
 
-
 def build_map_tensor(data: np.lib.npyio.NpzFile, map_mode: str) -> np.ndarray:
     occ = data["occupancy"].astype(np.float32)
     sdf = data["sdf"].astype(np.float32)
-
     if map_mode == "sdf":
         return sdf[None, ...]
     if map_mode == "occupancy":
         return (2.0 * occ - 1.0)[None, ...]
     if map_mode == "sdf_occupancy":
         return np.stack([sdf, 2.0 * occ - 1.0], axis=0).astype(np.float32)
-
     raise ValueError(f"Unsupported map_mode: {map_mode}")
-
 
 def denormalize_controls(u_norm: torch.Tensor, v_max: float, w_max: float) -> torch.Tensor:
     v = u_norm[..., 0] * v_max
     w = u_norm[..., 1] * w_max
     return torch.stack([v, w], dim=-1)
 
-
 def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: float) -> torch.Tensor:
-    # start: (B, 3), controls: (B, T, 2)
     _, T, _ = controls.shape
     cur = start
     states = [cur]
-
     for k in range(T):
         x = cur[:, 0]
         y = cur[:, 1]
         th = cur[:, 2]
         v = controls[:, k, 0]
         w = controls[:, k, 1]
-
         nxt = torch.stack(
             [
                 x + dt * v * torch.cos(th),
@@ -163,9 +133,7 @@ def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: floa
         )
         states.append(nxt)
         cur = nxt
-
     return torch.stack(states, dim=1)
-
 
 def sdf_query_bilinear_torch(
     sdf: torch.Tensor,
@@ -174,7 +142,6 @@ def sdf_query_bilinear_torch(
     map_size_m: float
 ) -> torch.Tensor:
     H, W = sdf.shape
-
     gx = torch.clamp((xs / map_size_m) * (W - 1), 0.0, W - 1.0)
     gy = torch.clamp((ys / map_size_m) * (H - 1), 0.0, H - 1.0)
 
@@ -182,7 +149,6 @@ def sdf_query_bilinear_torch(
     y0 = torch.floor(gy).long()
     x1 = torch.clamp(x0 + 1, max=W - 1)
     y1 = torch.clamp(y0 + 1, max=H - 1)
-
     tx = gx - x0.float()
     ty = gy - y0.float()
 
@@ -190,11 +156,9 @@ def sdf_query_bilinear_torch(
     v10 = sdf[y0, x1]
     v01 = sdf[y1, x0]
     v11 = sdf[y1, x1]
-
     v0 = (1.0 - tx) * v00 + tx * v10
     v1 = (1.0 - tx) * v01 + tx * v11
     return (1.0 - ty) * v0 + ty * v1
-
 
 def expand_to_batch(x: torch.Tensor, B: int) -> torch.Tensor:
     if x.shape[0] == B:
@@ -203,16 +167,12 @@ def expand_to_batch(x: torch.Tensor, B: int) -> torch.Tensor:
         return x.repeat(B, 1)
     raise ValueError(f"Cannot expand tensor with batch {x.shape[0]} to {B}")
 
-
-# ============================================================
-# Shared planning cost
-# ============================================================
-
+#The shared planning cost
 def planning_cost_from_controls(
-    controls: torch.Tensor,         # (B, T, 2) in physical units
-    start: torch.Tensor,            # (1,3) or (B,3)
-    goal: torch.Tensor,             # (1,3) or (B,3)
-    sdf_map: torch.Tensor,          # (H,W)
+    controls: torch.Tensor,         
+    start: torch.Tensor,            
+    goal: torch.Tensor,             
+    sdf_map: torch.Tensor,          
     dt: float,
     map_size_m: float,
     robot_radius: float,
@@ -226,27 +186,21 @@ def planning_cost_from_controls(
     B = controls.shape[0]
     start = expand_to_batch(start, B)
     goal = expand_to_batch(goal, B)
-
     states = rollout_unicycle_batch(start, controls, dt=dt)
-
     goal_pos_term = torch.sum((states[:, -1, :2] - goal[:, :2]) ** 2, dim=1)
     goal_theta_term = angle_diff_torch(states[:, -1, 2], goal[:, 2]) ** 2
-
     clearance = sdf_query_bilinear_torch(
         sdf_map,
         states[..., 0].reshape(-1),
         states[..., 1].reshape(-1),
         map_size_m=map_size_m,
     ).view(B, states.shape[1]) - robot_radius
-
     obs_term = F.relu(safety_margin_m - clearance).pow(2).sum(dim=1)
     ctrl_term = controls.pow(2).sum(dim=(1, 2))
-
     if controls.shape[1] > 1:
         smooth_term = (controls[:, 1:] - controls[:, :-1]).pow(2).sum(dim=(1, 2))
     else:
         smooth_term = torch.zeros_like(ctrl_term)
-
     phi = (
         w_goal_pos * goal_pos_term
         + w_goal_theta * goal_theta_term
@@ -254,7 +208,6 @@ def planning_cost_from_controls(
         + w_ctrl * ctrl_term
         + w_smooth * smooth_term
     )
-
     aux = {
         "goal_pos": goal_pos_term.detach(),
         "goal_theta": goal_theta_term.detach(),
@@ -265,10 +218,7 @@ def planning_cost_from_controls(
     return phi, states, aux
 
 
-# ============================================================
-# Diffusion schedule
-# ============================================================
-
+#Diffustion schedule
 class DiffusionSchedule(nn.Module):
     def __init__(self, num_steps: int, beta_start: float, beta_end: float):
         super().__init__()
@@ -276,27 +226,21 @@ class DiffusionSchedule(nn.Module):
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
         alpha_bars_prev = torch.cat([torch.ones(1, dtype=torch.float32), alpha_bars[:-1]], dim=0)
-
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
         self.register_buffer("alpha_bars_prev", alpha_bars_prev)
         self.num_steps = int(num_steps)
-
     def predict_x0_from_noise(self, xt: torch.Tensor, t: torch.Tensor, pred_noise: torch.Tensor) -> torch.Tensor:
         alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
         return (xt - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
 
 
-# ============================================================
-# Embeddings / encoders
-# ============================================================
-
+#Embeddings and encoders
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
         freqs = torch.exp(
@@ -307,7 +251,6 @@ class SinusoidalTimeEmbedding(nn.Module):
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
         return emb
-
 
 class MapEncoder(nn.Module):
     def __init__(self, in_ch: int, emb_dim: int):
@@ -328,7 +271,6 @@ class MapEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.net(x).flatten(1))
 
-
 class PoseEncoder(nn.Module):
     def __init__(self, in_dim: int = 8, emb_dim: int = 64):
         super().__init__()
@@ -341,11 +283,7 @@ class PoseEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-# ============================================================
-# 1D U-Net
-# ============================================================
-
+#One dimensional UNET
 class ResBlock1D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, cond_dim: int, groups: int = 8):
         super().__init__()
@@ -362,7 +300,6 @@ class ResBlock1D(nn.Module):
         h = self.conv2(F.silu(self.norm2(h)))
         return h + self.skip(x)
 
-
 class Downsample1D(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
@@ -370,7 +307,6 @@ class Downsample1D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
-
 
 class Upsample1D(nn.Module):
     def __init__(self, ch: int):
@@ -380,7 +316,6 @@ class Upsample1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x)
-
 
 class ConditionalTemporalUNet(nn.Module):
     def __init__(
@@ -412,7 +347,6 @@ class ConditionalTemporalUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
-
         ch = base_channels
         self.in_proj = nn.Conv1d(control_dim, ch, kernel_size=3, padding=1)
         self.down1 = ResBlock1D(ch, ch, cond_dim)
@@ -430,7 +364,6 @@ class ConditionalTemporalUNet(nn.Module):
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, map_tensor: torch.Tensor, pose_cond: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2)
-
         t_emb = self.time_mlp(self.time_emb(t))
         p_emb = self.pose_proj(self.pose_encoder(pose_cond))
         m_emb = self.map_proj(self.map_encoder(map_tensor))
@@ -453,10 +386,7 @@ class ConditionalTemporalUNet(nn.Module):
         return out.transpose(1, 2)
 
 
-# ============================================================
 # Projection objective
-# ============================================================
-
 def projection_objective(
     u_norm: torch.Tensor,
     u_ref: torch.Tensor,
@@ -477,7 +407,6 @@ def projection_objective(
     w_smooth: float,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     controls = denormalize_controls(u_norm, v_max=v_max, w_max=w_max)
-
     phi, _, aux_terms = planning_cost_from_controls(
         controls=controls,
         start=start,
@@ -493,10 +422,8 @@ def projection_objective(
         w_ctrl=w_ctrl,
         w_smooth=w_smooth,
     )
-
     prox = 0.5 * (u_norm - u_ref).pow(2).sum(dim=(1, 2))
     loss = (prox + proj_lambda * phi).mean()
-
     aux = {
         "prox": prox.mean().detach(),
         "phi": phi.mean().detach(),
@@ -507,7 +434,6 @@ def projection_objective(
         "smooth": aux_terms["smooth"].mean().detach(),
     }
     return loss, aux
-
 
 def run_projection_steps(
     u_init: torch.Tensor,
@@ -559,7 +485,6 @@ def run_projection_steps(
             w_ctrl=w_ctrl,
             w_smooth=w_smooth,
         )
-
         loss.backward()
         torch.nn.utils.clip_grad_norm_([u_proj], max_norm=1.0)
         opt.step()
@@ -573,11 +498,7 @@ def run_projection_steps(
 
     return u_proj.detach()
 
-
-# ============================================================
 # Diffusion sampler
-# ============================================================
-
 def sample_controls(
     model: nn.Module,
     schedule: DiffusionSchedule,
@@ -626,25 +547,20 @@ def sample_controls(
             alpha_bar_t = schedule.alpha_bars[t].view(-1, 1, 1)
             beta_t = schedule.betas[t].view(-1, 1, 1)
             alpha_bar_prev = schedule.alpha_bars_prev[t].view(-1, 1, 1)
-
             x0_hat = schedule.predict_x0_from_noise(x, t, pred_noise).clamp(-eta_clip, eta_clip)
-
             coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
             coef2 = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
             mean = coef1 * x0_hat + coef2 * x
-
             if step > 0:
                 posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
                 u_tilde = mean + torch.sqrt(posterior_var.clamp_min(1e-8)) * torch.randn_like(x)
             else:
                 u_tilde = mean
-
         k = step + 1
         do_project = use_projection and (
             ((project_every > 0) and (k % project_every == 0))
             or ((project_last_n_steps > 0) and (k <= project_last_n_steps))
         )
-
         if do_project:
             x = run_projection_steps(
                 u_init=u_tilde,
@@ -670,7 +586,6 @@ def sample_controls(
             )
         else:
             x = u_tilde.detach()
-
     if use_projection and final_proj_steps > 0:
         x = run_projection_steps(
             u_init=x,
@@ -694,14 +609,9 @@ def sample_controls(
             w_ctrl=w_ctrl,
             w_smooth=w_smooth,
         )
-
     return x
 
-
-# ============================================================
-# CEM / MPPI baselines
-# ============================================================
-
+#Cross entropy method and model predictive path integral methods
 @torch.no_grad()
 def cem_plan(
     start_tensor: torch.Tensor,
@@ -728,17 +638,14 @@ def cem_plan(
     device: str,
 ) -> torch.Tensor:
     elite_k = max(1, int(population * elite_frac))
-
     mean = torch.zeros(1, horizon, 2, device=device)
     std = torch.full((1, horizon, 2), init_std_norm, device=device)
-
     best_cost = float("inf")
     best_u_norm = mean.clone()
 
     for _ in range(iters):
         noise = torch.randn(population, horizon, 2, device=device)
         u_norm = (mean + std * noise).clamp(-1.0, 1.0)
-
         controls = denormalize_controls(u_norm, v_max=v_max, w_max=w_max)
         costs, _, _ = planning_cost_from_controls(
             controls=controls,
@@ -755,7 +662,6 @@ def cem_plan(
             w_ctrl=w_ctrl,
             w_smooth=w_smooth,
         )
-
         elite_idx = torch.topk(costs, k=elite_k, largest=False).indices
         elite = u_norm[elite_idx]
 
@@ -764,15 +670,12 @@ def cem_plan(
 
         mean = momentum * mean + (1.0 - momentum) * elite_mean
         std = momentum * std + (1.0 - momentum) * elite_std
-
         iter_best_idx = int(torch.argmin(costs).item())
         iter_best_cost = float(costs[iter_best_idx].item())
         if iter_best_cost < best_cost:
             best_cost = iter_best_cost
             best_u_norm = u_norm[iter_best_idx:iter_best_idx + 1].clone()
-
     return denormalize_controls(best_u_norm, v_max=v_max, w_max=w_max)
-
 
 @torch.no_grad()
 def mppi_plan(
@@ -800,7 +703,6 @@ def mppi_plan(
 ) -> torch.Tensor:
     u_nom = torch.zeros(1, horizon, 2, device=device)
     sigma = torch.tensor([sigma_v_norm, sigma_w_norm], device=device).view(1, 1, 2)
-
     best_cost = float("inf")
     best_u_norm = u_nom.clone()
 
@@ -832,7 +734,6 @@ def mppi_plan(
 
         delta = torch.sum(weights.view(-1, 1, 1) * (u_norm - u_nom), dim=0, keepdim=True)
         u_nom = (u_nom + delta).clamp(-1.0, 1.0)
-
         iter_best_idx = int(torch.argmin(costs).item())
         iter_best_cost = float(costs[iter_best_idx].item())
         if iter_best_cost < best_cost:
@@ -863,10 +764,7 @@ def mppi_plan(
     return denormalize_controls(best_u_norm, v_max=v_max, w_max=w_max)
 
 
-# ============================================================
-# Plotting
-# ============================================================
-
+#Plotter functions
 @torch.no_grad()
 def plot_rollouts(
     out_path: str,
@@ -883,7 +781,6 @@ def plot_rollouts(
     scenario_type: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 8))
-
     extent = [0.0, map_size_m, 0.0, map_size_m]
     occ_img = 1.0 - (occupancy_map >= 0.5).astype(np.float32)
     ax.imshow(
@@ -896,7 +793,6 @@ def plot_rollouts(
         interpolation="nearest",
         alpha=1.0,
     )
-
     for i in range(sampled_states.shape[0]):
         st = sampled_states[i]
         is_best = i == best_idx
@@ -909,7 +805,6 @@ def plot_rollouts(
             zorder=3 if is_best else 2,
             label=label,
         )
-
     ax.plot(
         expert_states[:, 0],
         expert_states[:, 1],
@@ -919,18 +814,14 @@ def plot_rollouts(
         label="expert",
         zorder=4,
     )
-
     ax.scatter([start[0]], [start[1]], s=80, marker="o", label="start", zorder=5)
     ax.scatter([goal[0]], [goal[1]], s=90, marker="*", label="goal", zorder=5)
-
     start_dx = 0.35 * math.cos(float(start[2]))
     start_dy = 0.35 * math.sin(float(start[2]))
     goal_dx = 0.35 * math.cos(float(goal[2]))
     goal_dy = 0.35 * math.sin(float(goal[2]))
-
     ax.arrow(float(start[0]), float(start[1]), start_dx, start_dy, width=0.02, length_includes_head=True, zorder=5)
     ax.arrow(float(goal[0]), float(goal[1]), goal_dx, goal_dy, width=0.02, length_includes_head=True, zorder=5)
-
     ax.set_xlim(0.0, map_size_m)
     ax.set_ylim(0.0, map_size_m)
     ax.set_aspect("equal")
@@ -948,7 +839,6 @@ def plot_rollouts(
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
-
 def plot_overlay_trajectories(
     out_path: str,
     occupancy_map: np.ndarray,
@@ -961,7 +851,6 @@ def plot_overlay_trajectories(
 ) -> None:
     if not method_records:
         return
-
     fig, ax = plt.subplots(figsize=(9, 9))
     extent = [0.0, map_size_m, 0.0, map_size_m]
     method_colors = {
@@ -971,7 +860,6 @@ def plot_overlay_trajectories(
         "mppi": "tab:red",
     }
     used_labels = set()
-
     occ_img = 1.0 - (occupancy_map >= 0.5).astype(np.float32)
     ax.imshow(
         occ_img,
@@ -984,7 +872,6 @@ def plot_overlay_trajectories(
         alpha=1.0,
         zorder=0,
     )
-
     ax.plot(
         expert_states[:, 0],
         expert_states[:, 1],
@@ -996,7 +883,6 @@ def plot_overlay_trajectories(
         label="expert",
     )
     used_labels.add("expert")
-
     for record in method_records:
         method = record["method"]
         color = method_colors.get(method, "tab:purple")
@@ -1013,7 +899,6 @@ def plot_overlay_trajectories(
         )
         if traj_label is not None:
             used_labels.add(method)
-
         start_label = "start" if "start" not in used_labels else None
         goal_label = "goal" if "goal" not in used_labels else None
         ax.scatter(start[0], start[1], s=60, marker="o", color="black", alpha=0.8, zorder=3, label=start_label)
@@ -1022,7 +907,6 @@ def plot_overlay_trajectories(
             used_labels.add("start")
         if goal_label is not None:
             used_labels.add("goal")
-
     ax.set_xlim(0.0, map_size_m)
     ax.set_ylim(0.0, map_size_m)
     ax.set_aspect("equal")
@@ -1036,10 +920,7 @@ def plot_overlay_trajectories(
     plt.close(fig)
 
 
-# ============================================================
-# Evaluation helpers
-# ============================================================
-
+#Evaluation helper functions
 @torch.no_grad()
 def evaluate_rollouts(
     states: torch.Tensor,
@@ -1051,10 +932,8 @@ def evaluate_rollouts(
     map_size_m: float,
 ) -> Dict[str, np.ndarray]:
     B = states.shape[0]
-
     pos_err = torch.linalg.norm(states[:, -1, :2] - goal[:, :2], dim=1)
     th_err = torch.abs(angle_diff_torch(states[:, -1, 2], goal[:, 2]))
-
     d = sdf_query_bilinear_torch(
         sdf_map,
         states[..., 0].reshape(-1),
@@ -1064,13 +943,11 @@ def evaluate_rollouts(
 
     min_clearance = torch.min(d, dim=1).values
     collision = torch.any(d < 0.0, dim=1)
-
     success = (
         (pos_err <= goal_pos_tol + 0.1)
         & (th_err <= math.radians(goal_theta_tol_deg)*2)
         & (~collision)
     )
-
     return {
         "final_pos_err": pos_err.cpu().numpy(),
         "final_theta_err_rad": th_err.cpu().numpy(),
@@ -1079,14 +956,12 @@ def evaluate_rollouts(
         "success": success.cpu().numpy(),
     }
 
-
 def best_index_from_metrics(metrics: Dict[str, np.ndarray]) -> int:
     score = metrics["final_pos_err"] + 0.5 * metrics["final_theta_err_rad"]
     success_mask = metrics["success"].astype(bool)
     if np.any(success_mask):
         return int(np.argmin(np.where(success_mask, score, np.inf)))
     return int(np.argmin(score))
-
 
 def mean_se(arr: List[float]) -> Tuple[float, float]:
     arr = np.asarray(arr, dtype=np.float64)
@@ -1095,7 +970,6 @@ def mean_se(arr: List[float]) -> Tuple[float, float]:
     if arr.size == 1:
         return float(arr.mean()), 0.0
     return float(arr.mean()), float(arr.std(ddof=1) / np.sqrt(arr.size))
-
 
 def summarize_case(metrics: Dict[str, np.ndarray], idx: int, runtime_ms: float) -> Dict[str, float]:
     return {
@@ -1107,7 +981,6 @@ def summarize_case(metrics: Dict[str, np.ndarray], idx: int, runtime_ms: float) 
         "runtime_ms": float(runtime_ms),
     }
 
-
 def aggregate_case_records(records: List[Dict[str, float]]) -> Dict[str, float]:
     success = [r["success"] for r in records]
     collision = [r["collision"] for r in records]
@@ -1115,7 +988,6 @@ def aggregate_case_records(records: List[Dict[str, float]]) -> Dict[str, float]:
     theta = [r["final_theta_err_rad"] for r in records]
     clear = [r["min_clearance"] for r in records]
     runtime = [r["runtime_ms"] for r in records]
-
     success_mean, success_se = mean_se(success)
     collision_mean, collision_se = mean_se(collision)
     pos_mean, pos_se = mean_se(pos)
@@ -1139,11 +1011,6 @@ def aggregate_case_records(records: List[Dict[str, float]]) -> Dict[str, float]:
         "runtime_ms_se": runtime_se,
     }
 
-
-# ============================================================
-# One-case runner
-# ============================================================
-
 def run_method_on_case(
     method: str,
     cfg: InferConfig,
@@ -1165,13 +1032,11 @@ def run_method_on_case(
 
     if method in ("diffusion_only", "diffusion_projected"):
         if method == "diffusion_only":
-           # print(f"Running diffusion sampling without projection on case {case['case_id']}...")
             map_tensor = case["map_tensor"].repeat(cfg.num_samples, 1, 1, 1)
             pose_tensor = case["pose_tensor"].repeat(cfg.num_samples, 1)
             start_tensor = case["start_tensor"].repeat(cfg.num_samples, 1)
             goal_tensor = case["goal_tensor"].repeat(cfg.num_samples, 1)
         if method == "diffusion_projected":
-              # print(f"Running diffusion sampling with projection on case {case['case_id']}...")
             map_tensor = case["map_tensor"].repeat(cfg.num_samples, 1, 1, 1)
             pose_tensor = case["pose_tensor"].repeat(cfg.num_samples, 1)
             start_tensor = case["start_tensor"].repeat(cfg.num_samples, 1)
@@ -1213,7 +1078,6 @@ def run_method_on_case(
             w_smooth=cfg.w_smooth,
             eta_clip=cfg.eta_clip,
         )
-
         controls = denormalize_controls(sampled_controls_norm, v_max=v_max, w_max=w_max)
         states = rollout_unicycle_batch(start_tensor, controls, dt=dt)
         metrics = evaluate_rollouts(
@@ -1226,7 +1090,6 @@ def run_method_on_case(
             map_size_m=map_size_m,
         )
         best_idx = best_index_from_metrics(metrics)
-
     elif method == "cem":
         controls = cem_plan(
             start_tensor=case["start_tensor"],
@@ -1263,7 +1126,6 @@ def run_method_on_case(
             map_size_m=map_size_m,
         )
         best_idx = 0
-
     elif method == "mppi":
         controls = mppi_plan(
             start_tensor=case["start_tensor"],
@@ -1299,7 +1161,6 @@ def run_method_on_case(
             map_size_m=map_size_m,
         )
         best_idx = 0
-
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -1307,16 +1168,12 @@ def run_method_on_case(
     return metrics, controls, states, best_idx, runtime_ms
 
 
-# ============================================================
-# Main
-# ============================================================
-
+#Main driver code
 def main() -> None:
     cfg = InferConfig()
     cfg.device = "cuda" 
     os.makedirs(cfg.out_dir, exist_ok=True)
     set_seed(cfg.random_seed)
-
     ckpt = torch.load(cfg.checkpoint_path, map_location=cfg.device)
     train_cfg = ckpt["train_cfg"]
     ds_cfg = ckpt["dataset_cfg"]
@@ -1340,7 +1197,6 @@ def main() -> None:
     ).to(cfg.device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-
     schedule = DiffusionSchedule(
         num_steps=int(train_cfg["diffusion_steps"]),
         beta_start=float(train_cfg["beta_start"]),
@@ -1355,7 +1211,6 @@ def main() -> None:
 
     if cfg.max_test_files is not None:
         files = files[:cfg.max_test_files]
-
     example_case_indices = set()
     if cfg.save_example_plots and cfg.example_plot_count > 0:
         rng = np.random.default_rng(cfg.random_seed)
@@ -1414,7 +1269,6 @@ def main() -> None:
         case_overlay_records: List[Dict] = []
 
         print(f"\n[{case_idx + 1}/{len(files)}] {os.path.basename(sample_path)} | scenario={scenario_type}")
-
         for method in methods:
             metrics, controls, states, best_idx, runtime_ms = run_method_on_case(
                 method=method,
@@ -1424,7 +1278,6 @@ def main() -> None:
                 case=case,
                 ds_cfg=ds_cfg,
             )
-
             case_summary = summarize_case(metrics, best_idx, runtime_ms)
             per_method_case_records[method].append(case_summary)
             per_method_detailed[method].append({
@@ -1450,7 +1303,6 @@ def main() -> None:
                     "method": method,
                     "best_states": states_np[best_idx].copy(),
                 })
-
         if cfg.save_example_plots and case_idx in example_case_indices and case_overlay_records:
             overlay_path = os.path.join(cfg.out_dir, f"methods_overlay_case{case_idx:04d}.png")
             plot_overlay_trajectories(
@@ -1464,7 +1316,6 @@ def main() -> None:
                 scenario_type=scenario_type,
             )
             print(f"  saved overlay plot: {overlay_path}")
-
     aggregate_results = {
         method: aggregate_case_records(records)
         for method, records in per_method_case_records.items()
@@ -1481,20 +1332,17 @@ def main() -> None:
             f"min_clear={summary['min_clearance_mean']:.4f} ± {summary['min_clearance_se']:.4f} | "
             f"runtime_ms={summary['runtime_ms_mean']:.2f} ± {summary['runtime_ms_se']:.2f}"
         )
-
     summary_payload = {
         "config": asdict(cfg),
         "num_test_files": len(files),
         "aggregate_results": aggregate_results,
         "per_method_case_records": per_method_detailed,
     }
-
     summary_path = os.path.join(cfg.out_dir, "full_testset_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary_payload, f, indent=2)
 
     print(f"\nSaved summary to: {summary_path}")
-
 
 if __name__ == "__main__":
     main()

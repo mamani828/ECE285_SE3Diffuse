@@ -1,12 +1,11 @@
+#Function to run the tests for ablations
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import glob
 import json
 import math
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, List
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,27 +14,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-# ============================================================
-# Config
-# ============================================================
-
+#Configurations
 @dataclass
 class AblationConfig:
-    # data
     data_root: str = "diffdrive_dataset"
     split: str = "test"
-    map_mode: str = "sdf"   # must match training
+    map_mode: str = "sdf"  
 
-    # device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     random_seed: int = 0
 
-    # sampling
     num_samples: int = 64
     eta_clip: float = 1.5
 
-    # projection defaults
     project_every: int = 10
     proj_steps: int = 6
     proj_lr: float = 0.06
@@ -50,55 +41,43 @@ class AblationConfig:
     proj_grad_clip_norm: float = 1.0
     safety_margin_m: float = 0.05
 
-    # planning cost weights
     w_goal_pos: float = 25.0
     w_goal_theta: float = 2.0
     w_obs: float = 400.0
     w_ctrl: float = 1e-3
     w_smooth: float = 0.02
 
-    # evaluation rule: match full-test evaluation by default
     use_relaxed_success_rule: bool = True
     success_pos_extra_m: float = 0.1
     success_theta_scale: float = 2.0
 
-    # outputs
     out_dir: str = "ablation_outputs"
 
-    # -------- matched checkpoints for rho sweep --------
     checkpoint_path_rho00: str = "checkpoints/diffdrive_kinodynamic_best.pt"
     checkpoint_path_rho05: str = "checkpoints_rho0.5/diffdrive_kinodynamic_best.pt"
     checkpoint_path_rho07: str = "checkpoints_rho0.7/diffdrive_kinodynamic_best.pt"
     checkpoint_path_rho08: str = "checkpoints_rho0.8/diffdrive_kinodynamic_best.pt"
     checkpoint_path_rho095: str = "checkpoints_rho0.95/diffdrive_kinodynamic_best.pt"
 
-    # lambda sweep uses one chosen matched checkpoint
     lambda_ablation_checkpoint_path: str = "checkpoints/diffdrive_kinodynamic_best.pt"
 
-    # sweeps
     lambda_values: Tuple[float, ...] = (0.001, 0.01,0.1)
     rho_values: Tuple[float, ...] = (0.0, 0.5, 0.7, 0.8, 0.95)
     project_every_values: Tuple[int, ...] = (0, 20, 10, 5, 2, 1)
 
 
-# ============================================================
-# Utilities
-# ============================================================
-
+#Utility functions
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def wrap_angle_torch(theta: torch.Tensor) -> torch.Tensor:
     return (theta + math.pi) % (2.0 * math.pi) - math.pi
 
-
 def angle_diff_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return wrap_angle_torch(a - b)
-
 
 def pose_condition(start: np.ndarray, goal: np.ndarray, map_size_m: float) -> np.ndarray:
     sx = 2.0 * (start[0] / map_size_m) - 1.0
@@ -116,7 +95,6 @@ def pose_condition(start: np.ndarray, goal: np.ndarray, map_size_m: float) -> np
         dtype=np.float32,
     )
 
-
 def build_map_tensor(data: np.lib.npyio.NpzFile, map_mode: str) -> np.ndarray:
     occ = data["occupancy"].astype(np.float32)
     sdf = data["sdf"].astype(np.float32)
@@ -127,15 +105,12 @@ def build_map_tensor(data: np.lib.npyio.NpzFile, map_mode: str) -> np.ndarray:
         return (2.0 * occ - 1.0)[None, ...]
     if map_mode == "sdf_occupancy":
         return np.stack([sdf, 2.0 * occ - 1.0], axis=0).astype(np.float32)
-
     raise ValueError(f"Unsupported map_mode: {map_mode}")
-
-
+    
 def denormalize_controls(u_norm: torch.Tensor, v_max: float, w_max: float) -> torch.Tensor:
     v = u_norm[..., 0] * v_max
     w = u_norm[..., 1] * w_max
     return torch.stack([v, w], dim=-1)
-
 
 def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: float) -> torch.Tensor:
     _, T, _ = controls.shape
@@ -148,7 +123,6 @@ def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: floa
         th = cur[:, 2]
         v = controls[:, k, 0]
         w = controls[:, k, 1]
-
         nxt = torch.stack(
             [
                 x + dt * v * torch.cos(th),
@@ -159,9 +133,7 @@ def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: floa
         )
         states.append(nxt)
         cur = nxt
-
     return torch.stack(states, dim=1)
-
 
 def sdf_query_bilinear_torch(
     sdf: torch.Tensor,
@@ -170,10 +142,8 @@ def sdf_query_bilinear_torch(
     map_size_m: float
 ) -> torch.Tensor:
     H, W = sdf.shape
-
     gx = torch.clamp((xs / map_size_m) * (W - 1), 0.0, W - 1.0)
     gy = torch.clamp((ys / map_size_m) * (H - 1), 0.0, H - 1.0)
-
     x0 = torch.floor(gx).long()
     y0 = torch.floor(gy).long()
     x1 = torch.clamp(x0 + 1, max=W - 1)
@@ -181,24 +151,19 @@ def sdf_query_bilinear_torch(
 
     tx = gx - x0.float()
     ty = gy - y0.float()
-
     v00 = sdf[y0, x0]
     v10 = sdf[y0, x1]
     v01 = sdf[y1, x0]
     v11 = sdf[y1, x1]
-
     v0 = (1.0 - tx) * v00 + tx * v10
     v1 = (1.0 - tx) * v01 + tx * v11
     return (1.0 - ty) * v0 + ty * v1
-
-
 def expand_to_batch(x: torch.Tensor, B: int) -> torch.Tensor:
     if x.shape[0] == B:
         return x
     if x.shape[0] == 1:
         return x.repeat(B, 1)
     raise ValueError(f"Cannot expand tensor with batch {x.shape[0]} to {B}")
-
 
 def checkpoint_for_rho(cfg: AblationConfig, rho: float) -> str:
     if abs(rho - 0.0) < 1e-9:
@@ -214,15 +179,12 @@ def checkpoint_for_rho(cfg: AblationConfig, rho: float) -> str:
     raise ValueError(f"No checkpoint configured for rho={rho}")
 
 
-# ============================================================
-# Shared planning cost
-# ============================================================
-
+#Shared planner cost
 def planning_cost_from_controls(
-    controls: torch.Tensor,         # (B, T, 2) in physical units
-    start: torch.Tensor,            # (1,3) or (B,3)
-    goal: torch.Tensor,             # (1,3) or (B,3)
-    sdf_map: torch.Tensor,          # (H,W)
+    controls: torch.Tensor,        
+    start: torch.Tensor,            
+    goal: torch.Tensor,             
+    sdf_map: torch.Tensor,        
     dt: float,
     map_size_m: float,
     robot_radius: float,
@@ -236,7 +198,6 @@ def planning_cost_from_controls(
     B = controls.shape[0]
     start = expand_to_batch(start, B)
     goal = expand_to_batch(goal, B)
-
     states = rollout_unicycle_batch(start, controls, dt=dt)
 
     goal_pos_term = torch.sum((states[:, -1, :2] - goal[:, :2]) ** 2, dim=1)
@@ -256,7 +217,6 @@ def planning_cost_from_controls(
         smooth_term = (controls[:, 1:] - controls[:, :-1]).pow(2).sum(dim=(1, 2))
     else:
         smooth_term = torch.zeros_like(ctrl_term)
-
     phi = (
         w_goal_pos * goal_pos_term
         + w_goal_theta * goal_theta_term
@@ -264,7 +224,6 @@ def planning_cost_from_controls(
         + w_ctrl * ctrl_term
         + w_smooth * smooth_term
     )
-
     aux = {
         "goal_pos": goal_pos_term.detach(),
         "goal_theta": goal_theta_term.detach(),
@@ -274,11 +233,7 @@ def planning_cost_from_controls(
     }
     return phi, states, aux
 
-
-# ============================================================
 # Diffusion schedule
-# ============================================================
-
 class DiffusionSchedule(nn.Module):
     def __init__(self, num_steps: int, beta_start: float, beta_end: float):
         super().__init__()
@@ -292,21 +247,15 @@ class DiffusionSchedule(nn.Module):
         self.register_buffer("alpha_bars", alpha_bars)
         self.register_buffer("alpha_bars_prev", alpha_bars_prev)
         self.num_steps = int(num_steps)
-
     def predict_x0_from_noise(self, xt: torch.Tensor, t: torch.Tensor, pred_noise: torch.Tensor) -> torch.Tensor:
         alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
         return (xt - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t.clamp_min(1e-8))
 
-
-# ============================================================
-# Embeddings / encoders
-# ============================================================
-
+# Embeddings and encoders
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
         freqs = torch.exp(
@@ -317,7 +266,6 @@ class SinusoidalTimeEmbedding(nn.Module):
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
         return emb
-
 
 class MapEncoder(nn.Module):
     def __init__(self, in_ch: int, emb_dim: int):
@@ -334,10 +282,8 @@ class MapEncoder(nn.Module):
             nn.AdaptiveAvgPool2d(1),
         )
         self.proj = nn.Linear(128, emb_dim)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.net(x).flatten(1))
-
 
 class PoseEncoder(nn.Module):
     def __init__(self, in_dim: int = 8, emb_dim: int = 64):
@@ -352,10 +298,7 @@ class PoseEncoder(nn.Module):
         return self.net(x)
 
 
-# ============================================================
-# 1D U-Net
-# ============================================================
-
+#One dimensional UNet
 class ResBlock1D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, cond_dim: int, groups: int = 8):
         super().__init__()
@@ -365,13 +308,11 @@ class ResBlock1D(nn.Module):
         self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1)
         self.cond_proj = nn.Linear(cond_dim, out_ch)
         self.skip = nn.Conv1d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
-
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         h = self.conv1(F.silu(self.norm1(x)))
         h = h + self.cond_proj(cond).unsqueeze(-1)
         h = self.conv2(F.silu(self.norm2(h)))
         return h + self.skip(x)
-
 
 class Downsample1D(nn.Module):
     def __init__(self, ch: int):
@@ -381,16 +322,13 @@ class Downsample1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
-
 class Upsample1D(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
         self.conv = nn.Conv1d(ch, ch, kernel_size=3, padding=1)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x)
-
 
 class ConditionalTemporalUNet(nn.Module):
     def __init__(
@@ -410,7 +348,6 @@ class ConditionalTemporalUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
-
         self.pose_encoder = PoseEncoder(in_dim=8, emb_dim=pose_emb_dim)
         self.pose_proj = nn.Linear(pose_emb_dim, cond_dim)
 
@@ -422,7 +359,6 @@ class ConditionalTemporalUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
-
         ch = base_channels
         self.in_proj = nn.Conv1d(control_dim, ch, kernel_size=3, padding=1)
         self.down1 = ResBlock1D(ch, ch, cond_dim)
@@ -463,10 +399,7 @@ class ConditionalTemporalUNet(nn.Module):
         return out.transpose(1, 2)
 
 
-# ============================================================
 # Projection objective
-# ============================================================
-
 def projection_objective(
     u_norm: torch.Tensor,
     u_ref: torch.Tensor,
@@ -503,7 +436,6 @@ def projection_objective(
         w_ctrl=w_ctrl,
         w_smooth=w_smooth,
     )
-
     prox = 0.5 * (u_norm - u_ref).pow(2).sum(dim=(1, 2))
     loss = (prox + proj_lambda * phi).mean()
 
@@ -517,7 +449,6 @@ def projection_objective(
         "smooth": aux_terms["smooth"].mean().detach(),
     }
     return loss, aux
-
 
 def run_projection_steps(
     u_init: torch.Tensor,
@@ -544,7 +475,6 @@ def run_projection_steps(
 ) -> torch.Tensor:
     if proj_steps <= 0:
         return u_init.detach()
-
     u_proj = u_init.detach().clone().requires_grad_(True)
     opt = torch.optim.Adam([u_proj], lr=proj_lr)
 
@@ -569,7 +499,6 @@ def run_projection_steps(
             w_ctrl=w_ctrl,
             w_smooth=w_smooth,
         )
-
         loss.backward()
         torch.nn.utils.clip_grad_norm_([u_proj], max_norm=proj_grad_clip_norm)
         opt.step()
@@ -580,14 +509,10 @@ def run_projection_steps(
 
         with torch.no_grad():
             u_proj.clamp_(-control_clip_norm, control_clip_norm)
-
     return u_proj.detach()
 
 
-# ============================================================
 # Correlated noise sampling
-# ============================================================
-
 def sample_ar1_noise(
     batch_size: int,
     horizon: int,
@@ -598,10 +523,8 @@ def sample_ar1_noise(
 ) -> torch.Tensor:
     if not (-1.0 < rho < 1.0):
         raise ValueError(f"AR(1) rho must satisfy -1 < rho < 1, got {rho}")
-
     if abs(rho) < 1e-12:
         return torch.randn(batch_size, horizon, dim, device=device, dtype=dtype)
-
     eps = torch.empty(batch_size, horizon, dim, device=device, dtype=dtype)
     eps[:, 0] = torch.randn(batch_size, dim, device=device, dtype=dtype)
     innov_scale = math.sqrt(max(1.0 - rho * rho, 1e-12))
@@ -609,9 +532,7 @@ def sample_ar1_noise(
     for t in range(1, horizon):
         eta_t = torch.randn(batch_size, dim, device=device, dtype=dtype)
         eps[:, t] = rho * eps[:, t - 1] + innov_scale * eta_t
-
     return eps
-
 
 def sample_temporal_noise_like(x: torch.Tensor, rho: float) -> torch.Tensor:
     if x.ndim != 3:
@@ -626,11 +547,7 @@ def sample_temporal_noise_like(x: torch.Tensor, rho: float) -> torch.Tensor:
         dtype=x.dtype,
     )
 
-
-# ============================================================
-# Diffusion sampler (matched correlated noise)
-# ============================================================
-
+# Diffusion sampler
 def sample_controls_correlated(
     model: nn.Module,
     schedule: DiffusionSchedule,
@@ -674,7 +591,6 @@ def sample_controls_correlated(
         torch.empty(B, horizon, control_dim, device=device),
         rho=rho,
     )
-
     for step in reversed(range(schedule.num_steps)):
         with torch.no_grad():
             t = torch.full((B,), step, device=device, dtype=torch.long)
@@ -697,13 +613,11 @@ def sample_controls_correlated(
                 u_tilde = mean + torch.sqrt(posterior_var.clamp_min(1e-8)) * z
             else:
                 u_tilde = mean
-
         k = step + 1
         do_project = use_projection and (
             ((project_every > 0) and (k % project_every == 0))
             or ((project_last_n_steps > 0) and (k <= project_last_n_steps))
         )
-
         if do_project:
             x = run_projection_steps(
                 u_init=u_tilde,
@@ -730,7 +644,6 @@ def sample_controls_correlated(
             )
         else:
             x = u_tilde.detach()
-
     if use_projection and final_proj_steps > 0:
         x = run_projection_steps(
             u_init=x,
@@ -755,14 +668,9 @@ def sample_controls_correlated(
             w_ctrl=w_ctrl,
             w_smooth=w_smooth,
         )
-
     return x
 
-
-# ============================================================
-# Evaluation
-# ============================================================
-
+#Evaluation
 @torch.no_grad()
 def evaluate_rollouts(
     states: torch.Tensor,
@@ -777,23 +685,18 @@ def evaluate_rollouts(
     success_theta_scale: float,
 ) -> Dict[str, np.ndarray]:
     B = states.shape[0]
-
     pos_err = torch.linalg.norm(states[:, -1, :2] - goal[:, :2], dim=1)
     th_err = torch.abs(angle_diff_torch(states[:, -1, 2], goal[:, 2]))
-
     d = sdf_query_bilinear_torch(
         sdf_map,
         states[..., 0].reshape(-1),
         states[..., 1].reshape(-1),
         map_size_m=map_size_m,
     ).view(B, states.shape[1]) - robot_radius
-
     min_clearance = torch.min(d, dim=1).values
     collision = torch.any(d < 0.0, dim=1)
-
     pos_thresh = goal_pos_tol + (success_pos_extra_m if use_relaxed_success_rule else 0.0)
     theta_thresh = math.radians(goal_theta_tol_deg) * (success_theta_scale if use_relaxed_success_rule else 1.0)
-
     success = (
         (pos_err <= pos_thresh)
         & (th_err <= theta_thresh)
@@ -808,7 +711,6 @@ def evaluate_rollouts(
         "success": success.cpu().numpy(),
     }
 
-
 def best_index_from_metrics(metrics: Dict[str, np.ndarray]) -> int:
     score = metrics["final_pos_err"] + 0.5 * metrics["final_theta_err_rad"]
     success_mask = metrics["success"].astype(bool)
@@ -816,11 +718,7 @@ def best_index_from_metrics(metrics: Dict[str, np.ndarray]) -> int:
         return int(np.argmin(np.where(success_mask, score, np.inf)))
     return int(np.argmin(score))
 
-
-# ============================================================
-# Model / checkpoint loading
-# ============================================================
-
+# Model and checkpoint loading
 def load_model_and_schedule_from_ckpt(
     checkpoint_path: str,
     cfg: AblationConfig,
@@ -830,7 +728,6 @@ def load_model_and_schedule_from_ckpt(
     ds_cfg = ckpt["dataset_cfg"]
 
     map_in_ch = 2 if cfg.map_mode == "sdf_occupancy" else 1
-
     model = ConditionalTemporalUNet(
         control_dim=2,
         map_in_ch=map_in_ch,
@@ -842,7 +739,6 @@ def load_model_and_schedule_from_ckpt(
     ).to(cfg.device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-
     schedule = DiffusionSchedule(
         num_steps=int(train_cfg["diffusion_steps"]),
         beta_start=float(train_cfg["beta_start"]),
@@ -854,10 +750,7 @@ def load_model_and_schedule_from_ckpt(
     return model, schedule, train_cfg, ds_cfg
 
 
-# ============================================================
-# Ablation 1: lambda sweep
-# ============================================================
-
+#Lambda ablations
 def run_ablation_lambda(
     cfg: AblationConfig,
     model: nn.Module,
@@ -867,7 +760,6 @@ def run_ablation_lambda(
     files: List[str],
 ) -> None:
     os.makedirs(cfg.out_dir, exist_ok=True)
-
     horizon = int(ds_cfg["horizon"])
     dt = float(ds_cfg["dt"])
     v_max = float(ds_cfg["v_max"])
@@ -878,7 +770,6 @@ def run_ablation_lambda(
     goal_theta_tol_deg = float(ds_cfg["goal_theta_tol_deg"])
 
     rho = float(train_cfg.get("noise_rho_train", 0.0))
-
     success_rates = []
     collision_rates = []
 
@@ -887,12 +778,10 @@ def run_ablation_lambda(
     print(f"Checkpoint: {cfg.lambda_ablation_checkpoint_path}")
     print(f"Matched rho used for sampling: {rho}")
     print("=" * 64)
-
     for lam in cfg.lambda_values:
         print(f"  lambda={lam:.4g} ...", end=" ", flush=True)
         successes = []
         collisions = []
-
         for sample_path in files:
             data = np.load(sample_path, allow_pickle=True)
 
@@ -901,7 +790,6 @@ def run_ablation_lambda(
             start_np = data["start"].astype(np.float32)
             goal_np = data["goal"].astype(np.float32)
             pcond_np = pose_condition(start_np, goal_np, map_size_m)
-
             map_tensor = torch.from_numpy(map_arr).unsqueeze(0).repeat(cfg.num_samples, 1, 1, 1).to(cfg.device)
             pose_tensor = torch.from_numpy(pcond_np).unsqueeze(0).repeat(cfg.num_samples, 1).to(cfg.device)
             start_t = torch.from_numpy(start_np).unsqueeze(0).repeat(cfg.num_samples, 1).to(cfg.device)
@@ -946,7 +834,6 @@ def run_ablation_lambda(
                 w_smooth=cfg.w_smooth,
                 eta_clip=cfg.eta_clip,
             )
-
             controls = denormalize_controls(u_norm, v_max=v_max, w_max=w_max)
             states = rollout_unicycle_batch(start_t, controls, dt=dt)
             metrics = evaluate_rollouts(
@@ -964,13 +851,11 @@ def run_ablation_lambda(
             best_idx = best_index_from_metrics(metrics)
             successes.append(float(metrics["success"][best_idx]))
             collisions.append(float(metrics["collision"][best_idx]))
-
         sr = 100.0 * float(np.mean(successes))
         cr = 100.0 * float(np.mean(collisions))
         success_rates.append(sr)
         collision_rates.append(cr)
         print(f"success={sr:.1f}%  collision={cr:.1f}%")
-
     payload = {
         "config": asdict(cfg),
         "checkpoint": cfg.lambda_ablation_checkpoint_path,
@@ -979,7 +864,6 @@ def run_ablation_lambda(
         "success_rates": success_rates,
         "collision_rates": collision_rates,
     }
-
     with open(os.path.join(cfg.out_dir, "ablation_lambda.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
@@ -996,38 +880,29 @@ def run_ablation_lambda(
     plot_path = os.path.join(cfg.out_dir, "ablation_lambda.png")
     fig.savefig(plot_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
-
     print(f"Saved: {plot_path}")
     print(f"Saved: {os.path.join(cfg.out_dir, 'ablation_lambda.json')}")
 
 
-# ============================================================
-# Ablation 2: rho x projection frequency
-# ============================================================
-
+#Rho ablations
 def run_ablation_ar1_projection(
     cfg: AblationConfig,
     files: List[str],
 ) -> None:
     os.makedirs(cfg.out_dir, exist_ok=True)
-
     print("\n" + "=" * 64)
     print("Ablation 2: matched rho x projection frequency")
     print("=" * 64)
-
     all_results: Dict[float, Dict[int, float]] = {}
     ds_cfg_ref = None
-
     for rho in cfg.rho_values:
         ckpt_path = checkpoint_for_rho(cfg, rho)
         print(f"\nLoading checkpoint for rho={rho}: {ckpt_path}")
-
         model, schedule, train_cfg, ds_cfg = load_model_and_schedule_from_ckpt(ckpt_path, cfg)
         ds_cfg_ref = ds_cfg
 
         rho_train = float(train_cfg.get("noise_rho_train", -999.0))
         print(f"  checkpoint train rho={rho_train}")
-
         horizon = int(ds_cfg["horizon"])
         dt = float(ds_cfg["dt"])
         v_max = float(ds_cfg["v_max"])
@@ -1036,7 +911,6 @@ def run_ablation_ar1_projection(
         robot_radius = float(ds_cfg["robot_radius"])
         goal_pos_tol = float(ds_cfg["goal_pos_tol"])
         goal_theta_tol_deg = float(ds_cfg["goal_theta_tol_deg"])
-
         all_results[rho] = {}
 
         for pe in cfg.project_every_values:
@@ -1047,7 +921,6 @@ def run_ablation_ar1_projection(
             successes = []
             for sample_path in files:
                 data = np.load(sample_path, allow_pickle=True)
-
                 map_arr = build_map_tensor(data, cfg.map_mode)
                 sdf_np = data["sdf"].astype(np.float32)
                 start_np = data["start"].astype(np.float32)
@@ -1059,7 +932,6 @@ def run_ablation_ar1_projection(
                 start_t = torch.from_numpy(start_np).unsqueeze(0).repeat(cfg.num_samples, 1).to(cfg.device)
                 goal_t = torch.from_numpy(goal_np).unsqueeze(0).repeat(cfg.num_samples, 1).to(cfg.device)
                 sdf_t = torch.from_numpy(sdf_np).to(cfg.device)
-
                 u_norm = sample_controls_correlated(
                     model=model,
                     schedule=schedule,
@@ -1098,7 +970,6 @@ def run_ablation_ar1_projection(
                     w_smooth=cfg.w_smooth,
                     eta_clip=cfg.eta_clip,
                 )
-
                 controls = denormalize_controls(u_norm, v_max=v_max, w_max=w_max)
                 states = rollout_unicycle_batch(start_t, controls, dt=dt)
                 metrics = evaluate_rollouts(
@@ -1115,33 +986,26 @@ def run_ablation_ar1_projection(
                 )
                 best_idx = best_index_from_metrics(metrics)
                 successes.append(float(metrics["success"][best_idx]))
-
             sr = 100.0 * float(np.mean(successes))
             all_results[rho][pe] = sr
             print(f"success={sr:.1f}%")
-
     serialisable = {
         str(rho): {str(pe): v for pe, v in inner.items()}
         for rho, inner in all_results.items()
     }
-
     payload = {
         "config": asdict(cfg),
         "rho_values": list(cfg.rho_values),
         "project_every_values": list(cfg.project_every_values),
         "results": serialisable,
     }
-
     with open(os.path.join(cfg.out_dir, "ablation_ar1_projection.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-
     x_labels = ["none" if pe == 0 else str(pe) for pe in cfg.project_every_values]
     x_pos = list(range(len(cfg.project_every_values)))
-
     fig, ax = plt.subplots(figsize=(8, 5))
     colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
     markers = ["o", "s", "^", "D", "v"]
-
     for i, rho in enumerate(cfg.rho_values):
         y_vals = [all_results[rho][pe] for pe in cfg.project_every_values]
         ax.plot(
@@ -1152,7 +1016,6 @@ def run_ablation_ar1_projection(
             linewidth=2,
             label=f"rho={rho}",
         )
-
     ax.set_xticks(x_pos)
     ax.set_xticklabels(x_labels)
     ax.set_xlabel("Projection frequency (every N diffusion steps)")
@@ -1170,25 +1033,19 @@ def run_ablation_ar1_projection(
     print(f"Saved: {os.path.join(cfg.out_dir, 'ablation_ar1_projection.json')}")
 
 
-# ============================================================
-# Main
-# ============================================================
-
+#Main driver
 def main() -> None:
     cfg = AblationConfig()
     os.makedirs(cfg.out_dir, exist_ok=True)
     set_seed(cfg.random_seed)
-
     files = sorted(glob.glob(os.path.join(cfg.data_root, cfg.split, "*.npz")))
     if not files:
         raise FileNotFoundError(f"No .npz files found in {os.path.join(cfg.data_root, cfg.split)}")
-
     print(f"device: {cfg.device}")
     print(f"num test files: {len(files)}")
     print(f"output dir: {cfg.out_dir}")
     print(f"use_relaxed_success_rule: {cfg.use_relaxed_success_rule}")
 
-    # lambda sweep: use one chosen matched checkpoint
     model, schedule, train_cfg, ds_cfg = load_model_and_schedule_from_ckpt(
         cfg.lambda_ablation_checkpoint_path,
         cfg,
@@ -1202,14 +1059,11 @@ def main() -> None:
         files=files,
     )
 
-    # rho x projection sweep: load matched checkpoint per rho
     run_ablation_ar1_projection(
         cfg=cfg,
         files=files,
     )
-
     print("\nAll ablations complete.")
-
 
 if __name__ == "__main__":
     main()

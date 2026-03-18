@@ -4,6 +4,7 @@ import os
 import glob
 import json
 from dataclasses import dataclass, asdict, fields
+#typing helps debuging
 from typing import Dict, Optional
 
 import numpy as np
@@ -11,74 +12,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
-
-# ============================================================
-# Config
-# ============================================================
-
 @dataclass
 class TrainConfig:
     data_root: str = "diffdrive_dataset"
-    map_mode: str = "sdf"                 # "sdf", "occupancy", or "sdf_occupancy"
+    map_mode: str = "sdf"                
     map_size_m: float = 10.0
-
     batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 1e-6
     epochs: int = 80
     num_workers: int = 4
-
     diffusion_steps: int = 50
     beta_start: float = 1e-4
     beta_end: float = 2e-2
-
     base_channels: int = 64
     cond_dim: int = 128
     map_emb_dim: int = 128
     pose_emb_dim: int = 64
     time_emb_dim: int = 128
-
-    # Kinodynamic auxiliary losses
     w_noise: float = 1.0
     w_state: float = 0.25
     w_terminal: float = 1.0
     w_control_smooth: float = 0.02
-
     grad_clip_norm: float = 1.0
     save_dir: str = "checkpoints"
     seed: int = 7
-
-    # Correlated diffusion noise
     use_correlated_noise: bool = True
-    noise_corr_type: str = "ar1"          # only "ar1" implemented below
-    noise_rho_train: float = 0.95         # training-time temporal correlation
-    noise_rho_sample: float = 0.95        # inference-time temporal correlation
-
+    #difference here with the other file is we add noise
+    noise_corr_type: str = "ar1"        
+    noise_rho_train: float = 0.95        
+    noise_rho_sample: float = 0.95     
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ============================================================
-# Utilities
-# ============================================================
 
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def str2bool(value: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    value = value.strip().lower()
-    if value in {"true", "1", "yes", "y", "on"}:
-        return True
-    if value in {"false", "0", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
-
-
+#cli stuff
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train the correlated diffusion model.")
     default_cfg = TrainConfig()
@@ -88,7 +58,7 @@ def parse_args() -> TrainConfig:
         arg_name = f"--{field.name}"
 
         if isinstance(default_value, bool):
-            parser.add_argument(arg_name, type=str2bool, default=default_value)
+            parser.add_argument(arg_name, type=lambda x: (str(x).lower() in ["true", "1"]), default=default_value)
         elif isinstance(default_value, int) and not isinstance(default_value, bool):
             parser.add_argument(arg_name, type=int, default=default_value)
         elif isinstance(default_value, float):
@@ -100,16 +70,10 @@ def parse_args() -> TrainConfig:
 
     args = parser.parse_args()
     return TrainConfig(**vars(args))
-
-
 def wrap_angle_torch(theta: torch.Tensor) -> torch.Tensor:
     return (theta + math.pi) % (2.0 * math.pi) - math.pi
-
-
 def angle_diff_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return wrap_angle_torch(a - b)
-
-
 def load_dataset_config(data_root: str) -> Dict:
     cfg_path = os.path.join(data_root, "config.json")
     if not os.path.exists(cfg_path):
@@ -117,23 +81,7 @@ def load_dataset_config(data_root: str) -> Dict:
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
-def sample_ar1_noise(
-    batch_size: int,
-    horizon: int,
-    dim: int,
-    rho: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    Sample AR(1) Gaussian noise over the time dimension:
-        eps[:, t] = rho * eps[:, t-1] + sqrt(1-rho^2) * eta_t
-    where eta_t ~ N(0, I).
-
-    Each control channel is independent; time is correlated.
-    Marginal variance at each timestep is 1.
-    """
+def sample_ar1_noise(batch_size: int,horizon: int,dim: int,rho: float,device: torch.device,dtype: torch.dtype,) -> torch.Tensor:
     if not (-1.0 < rho < 1.0):
         raise ValueError(f"AR(1) rho must satisfy -1 < rho < 1, got {rho}")
 
@@ -151,25 +99,9 @@ def sample_ar1_noise(
     return eps
 
 
-def sample_diffusion_noise_like(
-    x: torch.Tensor,
-    use_correlated_noise: bool,
-    rho: float,
-    corr_type: str = "ar1",
-) -> torch.Tensor:
-    """
-    Sample diffusion noise with the same shape as x.
-    Expects x to have shape (B, T, D).
-    """
+def sample_diffusion_noise_like(x: torch.Tensor,use_correlated_noise: bool,rho: float,corr_type: str = "ar1") -> torch.Tensor:
     if not use_correlated_noise:
         return torch.randn_like(x)
-
-    if x.ndim != 3:
-        raise ValueError(f"Expected x to have shape (B, T, D), got {tuple(x.shape)}")
-
-    if corr_type != "ar1":
-        raise ValueError(f"Unsupported corr_type: {corr_type}")
-
     B, T, D = x.shape
     return sample_ar1_noise(
         batch_size=B,
@@ -177,38 +109,19 @@ def sample_diffusion_noise_like(
         dim=D,
         rho=rho,
         device=x.device,
-        dtype=x.dtype,
-    )
-
-
-# ============================================================
-# Dataset
-# ============================================================
-
+        dtype=x.dtype,)
+#
 class DiffDriveDataset(Dataset):
-    def __init__(
-        self,
-        root: str,
-        split: str,
-        map_mode: str,
-        map_size_m: float,
-        v_max: float,
-        w_max: float,
-        horizon: int,
-    ):
+    def __init__(self,root: str,split: str,map_mode: str,map_size_m: float,v_max: float, w_max: float,horizon: int):
         self.files = sorted(glob.glob(os.path.join(root, split, "*.npz")))
-        if not self.files:
-            raise FileNotFoundError(f"No .npz files found in {os.path.join(root, split)}")
-
         self.map_mode = map_mode
         self.map_size_m = map_size_m
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.horizon = int(horizon)
-
     def __len__(self) -> int:
         return len(self.files)
-
+    # pose cond 8 dims
     def _pose_condition(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
         sx = 2.0 * (start[0] / self.map_size_m) - 1.0
         sy = 2.0 * (start[1] / self.map_size_m) - 1.0
@@ -217,13 +130,10 @@ class DiffDriveDataset(Dataset):
         sth = float(start[2])
         gth = float(goal[2])
         return np.asarray(
-            [
-                sx, sy, math.cos(sth), math.sin(sth),
-                gx, gy, math.cos(gth), math.sin(gth),
-            ],
+            [sx, sy, math.cos(sth), math.sin(sth),gx, gy, math.cos(gth), math.sin(gth),],
             dtype=np.float32,
         )
-
+    # normalize controls to [-1,1],=
     def _normalize_controls(self, controls: np.ndarray) -> np.ndarray:
         u = controls.astype(np.float32).copy()
         u[:, 0] /= max(self.v_max, 1e-6)
@@ -233,7 +143,7 @@ class DiffDriveDataset(Dataset):
     def _build_map_tensor(self, data: np.lib.npyio.NpzFile) -> np.ndarray:
         occ = data["occupancy"].astype(np.float32)
         sdf = data["sdf"].astype(np.float32)
-
+        # diffeent types of occupancy left for future work.
         if self.map_mode == "sdf":
             return sdf[None, ...]
         if self.map_mode == "occupancy":
@@ -244,45 +154,33 @@ class DiffDriveDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data = np.load(self.files[idx], allow_pickle=True)
-
         map_arr = self._build_map_tensor(data)
         start = data["start"].astype(np.float32)
         goal = data["goal"].astype(np.float32)
         controls = data["controls"].astype(np.float32)
         states = data["states"].astype(np.float32)
-
         valid_horizon = int(data["valid_horizon"]) if "valid_horizon" in data else controls.shape[0]
         valid_horizon = max(1, min(valid_horizon, controls.shape[0], self.horizon))
-
         controls = controls[: self.horizon]
         states = states[: self.horizon + 1]
-
         pose_cond = self._pose_condition(start, goal)
         controls_norm = self._normalize_controls(controls)
-
         ctrl_mask = np.zeros((self.horizon, 1), dtype=np.float32)
         ctrl_mask[:valid_horizon] = 1.0
-
         state_mask = np.zeros((self.horizon + 1, 1), dtype=np.float32)
         state_mask[: valid_horizon + 1] = 1.0
-
         return {
-            "map": torch.from_numpy(map_arr),                    # (C,H,W)
-            "pose_cond": torch.from_numpy(pose_cond),            # (8,)
-            "start": torch.from_numpy(start),                    # (3,)
-            "goal": torch.from_numpy(goal),                      # (3,)
-            "controls": torch.from_numpy(controls_norm),         # (T,2)
-            "states": torch.from_numpy(states),                  # (T+1,3)
-            "control_mask": torch.from_numpy(ctrl_mask),         # (T,1)
-            "state_mask": torch.from_numpy(state_mask),          # (T+1,1)
+            "map": torch.from_numpy(map_arr),              
+            "pose_cond": torch.from_numpy(pose_cond),        
+            "start": torch.from_numpy(start),                
+            "goal": torch.from_numpy(goal),                  
+            "controls": torch.from_numpy(controls_norm),      
+            "states": torch.from_numpy(states),              
+            "control_mask": torch.from_numpy(ctrl_mask),      
+            "state_mask": torch.from_numpy(state_mask),        
             "valid_horizon": torch.tensor(valid_horizon, dtype=torch.long),
         }
-
-
-# ============================================================
-# Diffusion schedule
-# ============================================================
-
+# diff sched
 class DiffusionSchedule(nn.Module):
     def __init__(self, num_steps: int, beta_start: float, beta_end: float):
         super().__init__()
@@ -290,31 +188,24 @@ class DiffusionSchedule(nn.Module):
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
         alpha_bars_prev = torch.cat([torch.ones(1, dtype=torch.float32), alpha_bars[:-1]], dim=0)
-
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
         self.register_buffer("alpha_bars_prev", alpha_bars_prev)
         self.num_steps = int(num_steps)
-
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
         return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1.0 - alpha_bar_t) * noise
-
     def predict_x0_from_noise(self, xt: torch.Tensor, t: torch.Tensor, pred_noise: torch.Tensor) -> torch.Tensor:
         alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
         return (xt - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t.clamp_min(1e-8))
 
-
-# ============================================================
-# Embeddings / encoders
-# ============================================================
+#sinouiidal embedd
 
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
         freqs = torch.exp(
@@ -325,8 +216,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
         return emb
-
-
+#CNN for encoding map
 class MapEncoder(nn.Module):
     def __init__(self, in_ch: int, emb_dim: int):
         super().__init__()
@@ -342,11 +232,10 @@ class MapEncoder(nn.Module):
             nn.AdaptiveAvgPool2d(1),
         )
         self.proj = nn.Linear(128, emb_dim)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.net(x).flatten(1))
 
-
+#pose encoding
 class PoseEncoder(nn.Module):
     def __init__(self, in_dim: int = 8, emb_dim: int = 64):
         super().__init__()
@@ -359,10 +248,7 @@ class PoseEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-# ============================================================
-# 1D U-Net
-# ============================================================
+#residual block for up/down sample
 
 class ResBlock1D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, cond_dim: int, groups: int = 8):
@@ -379,8 +265,6 @@ class ResBlock1D(nn.Module):
         h = h + self.cond_proj(cond).unsqueeze(-1)
         h = self.conv2(F.silu(self.norm2(h)))
         return h + self.skip(x)
-
-
 class Downsample1D(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
@@ -388,8 +272,6 @@ class Downsample1D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
-
-
 class Upsample1D(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
@@ -398,8 +280,6 @@ class Upsample1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x)
-
-
 class ConditionalTemporalUNet(nn.Module):
     def __init__(
         self,
@@ -468,22 +348,14 @@ class ConditionalTemporalUNet(nn.Module):
         u2 = self.up2(u2, cond)
         out = self.out_proj(F.silu(self.out_norm(u2)))
         return out.transpose(1, 2)
-
-
-# ============================================================
-# Differentiable dynamics rollout
-# ============================================================
-
+#denorm
 def denormalize_controls(u_norm: torch.Tensor, v_max: float, w_max: float) -> torch.Tensor:
     v = u_norm[..., 0] * v_max
     w = u_norm[..., 1] * w_max
     return torch.stack([v, w], dim=-1)
 
-
 def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: float) -> torch.Tensor:
-    # start: (B,3), controls: (B,T,2)
     _, T, _ = controls.shape
-
     cur = start
     states = [cur]
     for k in range(T):
@@ -492,32 +364,21 @@ def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: floa
         th = cur[:, 2]
         v = controls[:, k, 0]
         w = controls[:, k, 1]
-
         nxt = torch.stack(
-            [
-                x + dt * v * torch.cos(th),
-                y + dt * v * torch.sin(th),
-                wrap_angle_torch(th + dt * w),
-            ],
-            dim=-1,
-        )
+            [x + dt * v * torch.cos(th),  y + dt * v * torch.sin(th),wrap_angle_torch(th + dt * w),],dim=-1)
         states.append(nxt)
         cur = nxt
 
     return torch.stack(states, dim=1)
-
-
-# ============================================================
-# Losses
-# ============================================================
-
+# losses
+#maskd mse loss for noise pred
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     diff = (pred - target) ** 2
     diff = diff * mask
     denom = mask.sum().clamp_min(1.0) * pred.shape[-1]
     return diff.sum() / denom
 
-
+#state tracking loss
 def state_tracking_loss(pred_states: torch.Tensor, gt_states: torch.Tensor, state_mask: torch.Tensor) -> torch.Tensor:
     pos_loss = ((pred_states[..., :2] - gt_states[..., :2]) ** 2) * state_mask
     th_err = angle_diff_torch(pred_states[..., 2], gt_states[..., 2]).unsqueeze(-1)
@@ -526,7 +387,7 @@ def state_tracking_loss(pred_states: torch.Tensor, gt_states: torch.Tensor, stat
     th_term = th_loss.sum() / state_mask.sum().clamp_min(1.0)
     return pos_term + 0.25 * th_term
 
-
+#terminal loss to encourage reaching the goal, only look at the final valid state and the goal, and also mask out invalid states based on valid horizon
 def terminal_loss(pred_states: torch.Tensor, goal: torch.Tensor, valid_horizon: torch.Tensor) -> torch.Tensor:
     B = pred_states.shape[0]
     idx = valid_horizon.clamp(min=1, max=pred_states.shape[1] - 1)
@@ -537,7 +398,7 @@ def terminal_loss(pred_states: torch.Tensor, goal: torch.Tensor, valid_horizon: 
     th = torch.mean(th ** 2)
     return pos + 0.5 * th
 
-
+#smoothness loss to encourage smoother control sequences, only look at valid control steps based on control mask
 def smoothness_loss(u: torch.Tensor, control_mask: torch.Tensor) -> torch.Tensor:
     if u.shape[1] < 2:
         return torch.zeros((), device=u.device, dtype=u.dtype)
@@ -546,9 +407,7 @@ def smoothness_loss(u: torch.Tensor, control_mask: torch.Tensor) -> torch.Tensor
     return masked_mse(du, torch.zeros_like(du), mask)
 
 
-# ============================================================
-# Train / eval
-# ============================================================
+#train
 
 def run_epoch(
     model: nn.Module,
@@ -563,7 +422,6 @@ def run_epoch(
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
-
     meters = {
         "loss": 0.0,
         "noise": 0.0,
@@ -631,10 +489,7 @@ def run_epoch(
     n = max(1, meters.pop("n"))
     return {k: v / n for k, v in meters.items()}
 
-
-# ============================================================
-# DDPM sampler with correlated reverse-time innovations
-# ============================================================
+#DDPM 
 
 @torch.no_grad()
 def sample_controls(
@@ -651,63 +506,40 @@ def sample_controls(
     noise_corr_type: str = "ar1",
 ) -> torch.Tensor:
     B = map_tensor.shape[0]
-
-    # Prior x_K ~ N(0, Sigma_rho) if correlated, else N(0, I)
     x = sample_diffusion_noise_like(
         torch.empty(B, horizon, control_dim, device=device),
         use_correlated_noise=use_correlated_noise,
         rho=noise_rho,
         corr_type=noise_corr_type,
     )
-
     for step in reversed(range(schedule.num_steps)):
         t = torch.full((B,), step, device=device, dtype=torch.long)
         pred_noise = model(x, t, map_tensor, pose_cond)
-
         alpha_t = schedule.alphas[t].view(-1, 1, 1)
         alpha_bar_t = schedule.alpha_bars[t].view(-1, 1, 1)
         beta_t = schedule.betas[t].view(-1, 1, 1)
         alpha_bar_prev = schedule.alpha_bars_prev[t].view(-1, 1, 1)
-
         x0_hat = schedule.predict_x0_from_noise(x, t, pred_noise).clamp(-eta_clip, eta_clip)
-
         coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
         coef2 = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
         mean = coef1 * x0_hat + coef2 * x
-
         if step > 0:
             posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
-
-            z = sample_diffusion_noise_like(
-                x,
-                use_correlated_noise=use_correlated_noise,
-                rho=noise_rho,
-                corr_type=noise_corr_type,
-            )
+            z = sample_diffusion_noise_like(x,use_correlated_noise=use_correlated_noise,rho=noise_rho,corr_type=noise_corr_type)
             x = mean + torch.sqrt(posterior_var.clamp_min(1e-8)) * z
         else:
             x = mean
 
     return x
 
-
-# ============================================================
-# Main
-# ============================================================
-
 def main() -> None:
     cfg = parse_args()
     set_seed(cfg.seed)
-
     ds_cfg = load_dataset_config(cfg.data_root)
     horizon = int(ds_cfg["horizon"])
     v_max = float(ds_cfg["v_max"])
     w_max = float(ds_cfg["w_max"])
     dt = float(ds_cfg["dt"])
-
-    if abs(cfg.map_size_m - float(ds_cfg["map_size_m"])) > 1e-6:
-        raise ValueError("TrainConfig.map_size_m does not match dataset config")
-
     map_in_ch = 2 if cfg.map_mode == "sdf_occupancy" else 1
 
     train_ds = DiffDriveDataset(

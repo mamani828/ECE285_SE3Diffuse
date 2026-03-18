@@ -1,9 +1,4 @@
-# Fast standalone differential-drive dataset generator
-# - Self-contained (stdlib + numpy)
-# - Much faster than CEM-based generation
-# - Uses grid A* + pure-pursuit-like tracker to create expert labels
-# - Saves train/val/test as compressed NPZ files
-
+#Generate the dataset we use here
 import os
 import json
 import math
@@ -11,49 +6,39 @@ import heapq
 import random
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 
-
-# ============================================================
-# Config
-# ============================================================
-
+#Configurations
 @dataclass
 class Config:
-    # World
+
     map_size_m: float = 10.0
     grid_size: int = 64
     robot_radius: float = 0.10
     safety_margin: float = 0.03
 
-    # Rollout
     dt: float = 0.10
     horizon: int = 64
     v_max: float = 1.5
     w_max: float = 1.5
-    a_v: float = 2.0          # soft accel limit used by tracker
-    a_w: float = 4.0          # soft angular accel limit
+    a_v: float = 2.0          
+    a_w: float = 4.0          
 
-    # Goal
     goal_pos_tol: float = 0.20
     goal_theta_tol_deg: float = 18.0
 
-    # Sampling
     min_start_goal_dist: float = 3.0
     max_start_goal_dist: float = 7.0
     min_clearance_start_goal: float = 0.25
     reject_easy_if_line_clearer_than: float = 0.90
     max_attempts_per_sample: int = 20
 
-    # Dataset size
-    out_dir: str = "diffdrive_fast_dataset"
+    out_dir: str = "diffdrive_fast_dataset_test"
     n_train: int = 1000
     n_val: int = 200
     n_test: int = 100
     seed: int = 7
 
-    # Scenario mix
     p_open: float = 0.08
     p_clutter: float = 0.42
     p_corridor: float = 0.18
@@ -61,33 +46,26 @@ class Config:
     p_parking: float = 0.12
 
 
-# ============================================================
-# Utilities
-# ============================================================
+#Helper functions used
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
-
 def wrap_angle(x: np.ndarray) -> np.ndarray:
     return (x + np.pi) % (2.0 * np.pi) - np.pi
-
 
 def angle_diff(a: float, b: float) -> float:
     return float(wrap_angle(np.array([a - b], dtype=np.float32))[0])
 
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, x)))
-
 
 def world_to_grid(x: float, y: float, cfg: Config) -> Tuple[int, int]:
     s = cfg.grid_size / cfg.map_size_m
     gx = int(np.clip(x * s, 0, cfg.grid_size - 1))
     gy = int(np.clip(y * s, 0, cfg.grid_size - 1))
     return gx, gy
-
 
 def grid_to_world(path: List[Tuple[int, int]], cfg: Config) -> np.ndarray:
     s = cfg.map_size_m / cfg.grid_size
@@ -96,7 +74,6 @@ def grid_to_world(path: List[Tuple[int, int]], cfg: Config) -> np.ndarray:
         out[i, 0] = (gx + 0.5) * s
         out[i, 1] = (gy + 0.5) * s
     return out
-
 
 def simplify_polyline(pts: np.ndarray, min_spacing: float = 0.20) -> np.ndarray:
     if len(pts) <= 1:
@@ -110,7 +87,6 @@ def simplify_polyline(pts: np.ndarray, min_spacing: float = 0.20) -> np.ndarray:
     if np.linalg.norm(kept[-1] - pts[-1]) > 1e-6:
         kept.append(pts[-1])
     return np.asarray(kept, dtype=np.float32)
-
 
 def rasterize_waypoints_to_grid(waypoints: np.ndarray, cfg: Config) -> np.ndarray:
     grid = np.zeros((cfg.grid_size, cfg.grid_size), dtype=np.float32)
@@ -129,18 +105,13 @@ def rasterize_waypoints_to_grid(waypoints: np.ndarray, cfg: Config) -> np.ndarra
             grid[gy, gx] = 1.0
     return grid
 
-
-# ============================================================
-# Map representation
-# ============================================================
-
+#Class to represent the map
 class OccupancyMap:
     def __init__(self, occupancy: np.ndarray, sdf: np.ndarray, scenario_type: str, meta: Optional[Dict] = None):
         self.occupancy = occupancy.astype(np.uint8)
         self.sdf = sdf.astype(np.float32)
         self.scenario_type = scenario_type
         self.meta = meta or {}
-
 
 def add_rect_obstacle(occ: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> None:
     x0 = max(0, min(occ.shape[1], x0))
@@ -153,14 +124,12 @@ def add_rect_obstacle(occ: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> No
         y0, y1 = y1, y0
     occ[y0:y1, x0:x1] = 1
 
-
 def build_occ_from_rects(rects_m: List[Tuple[float, float, float, float]], cfg: Config) -> np.ndarray:
     occ = np.zeros((cfg.grid_size, cfg.grid_size), dtype=np.uint8)
     occ[0:1, :] = 1
     occ[-1:, :] = 1
     occ[:, 0:1] = 1
     occ[:, -1:] = 1
-
     s = cfg.grid_size / cfg.map_size_m
     for xmin, ymin, xmax, ymax in rects_m:
         add_rect_obstacle(
@@ -172,18 +141,14 @@ def build_occ_from_rects(rects_m: List[Tuple[float, float, float, float]], cfg: 
         )
     return occ
 
-
 def grid_world_centers(cfg: Config) -> Tuple[np.ndarray, np.ndarray]:
     xs = (np.arange(cfg.grid_size, dtype=np.float32) + 0.5) * (cfg.map_size_m / cfg.grid_size)
     ys = (np.arange(cfg.grid_size, dtype=np.float32) + 0.5) * (cfg.map_size_m / cfg.grid_size)
     return np.meshgrid(xs, ys, indexing="xy")
 
-
 def compute_sdf_from_rects(rects_m: List[Tuple[float, float, float, float]], cfg: Config) -> np.ndarray:
-    # Analytical SDF to rectangles + box walls. Fast and standalone.
     X, Y = grid_world_centers(cfg)
     sdf = np.full((cfg.grid_size, cfg.grid_size), np.inf, dtype=np.float32)
-
     for xmin, ymin, xmax, ymax in rects_m:
         cx = 0.5 * (xmin + xmax)
         cy = 0.5 * (ymin + ymax)
@@ -198,11 +163,9 @@ def compute_sdf_from_rects(rects_m: List[Tuple[float, float, float, float]], cfg
         inside = np.minimum(np.maximum(dx, dy), 0.0)
         rect_sdf = outside + inside
         sdf = np.minimum(sdf, rect_sdf.astype(np.float32))
-
     wall_dist = np.minimum.reduce([X, Y, cfg.map_size_m - X, cfg.map_size_m - Y]).astype(np.float32)
     sdf = np.minimum(sdf, wall_dist)
     return sdf
-
 
 def sdf_query_bilinear(sdf: np.ndarray, xs: np.ndarray, ys: np.ndarray, cfg: Config) -> np.ndarray:
     gx = np.clip((xs / cfg.map_size_m) * (cfg.grid_size - 1), 0.0, cfg.grid_size - 1.0)
@@ -225,7 +188,6 @@ def sdf_query_bilinear(sdf: np.ndarray, xs: np.ndarray, ys: np.ndarray, cfg: Con
     v1 = (1.0 - tx) * v01 + tx * v11
     return ((1.0 - ty) * v0 + ty * v1).astype(np.float32)
 
-
 def sdf_query_single(sdf: np.ndarray, x: float, y: float, cfg: Config) -> float:
     return float(sdf_query_bilinear(
         sdf,
@@ -235,14 +197,11 @@ def sdf_query_single(sdf: np.ndarray, x: float, y: float, cfg: Config) -> float:
     )[0])
 
 
-# ============================================================
-# Map generators
-# ============================================================
+#Generate the map
 
 def generate_open_map(cfg: Config) -> OccupancyMap:
     rects: List[Tuple[float, float, float, float]] = []
     return OccupancyMap(build_occ_from_rects(rects, cfg), compute_sdf_from_rects(rects, cfg), "open", {"task_hint": "free_space"})
-
 
 def generate_clutter_map(cfg: Config) -> OccupancyMap:
     rects: List[Tuple[float, float, float, float]] = []
@@ -253,7 +212,6 @@ def generate_clutter_map(cfg: Config) -> OccupancyMap:
         y = random.uniform(0.5, cfg.map_size_m - 0.5 - h)
         rects.append((x, y, x + w, y + h))
     return OccupancyMap(build_occ_from_rects(rects, cfg), compute_sdf_from_rects(rects, cfg), "clutter", {"task_hint": "obstacle_avoidance"})
-
 
 def generate_corridor_map(cfg: Config) -> OccupancyMap:
     rects: List[Tuple[float, float, float, float]] = []
@@ -270,7 +228,6 @@ def generate_corridor_map(cfg: Config) -> OccupancyMap:
         rects.append((cx + corridor_width / 2.0, 0.0, cfg.map_size_m, cfg.map_size_m))
         meta = {"orientation": orientation, "center": cx, "width": corridor_width}
     return OccupancyMap(build_occ_from_rects(rects, cfg), compute_sdf_from_rects(rects, cfg), "corridor", meta)
-
 
 def generate_doorway_map(cfg: Config) -> OccupancyMap:
     rects: List[Tuple[float, float, float, float]] = []
@@ -298,13 +255,10 @@ def generate_doorway_map(cfg: Config) -> OccupancyMap:
         h = random.uniform(0.4, 1.0)
         x = random.uniform(0.5, cfg.map_size_m - 0.5 - w)
         y = random.uniform(0.5, cfg.map_size_m - 0.5 - h)
-        # Avoid blocking the doorway region itself.
         if not (x + w < door_box[0] or x > door_box[2] or y + h < door_box[1] or y > door_box[3]):
             continue
         rects.append((x, y, x + w, y + h))
-
     return OccupancyMap(build_occ_from_rects(rects, cfg), compute_sdf_from_rects(rects, cfg), "doorway", meta)
-
 
 def generate_parking_map(cfg: Config) -> OccupancyMap:
     rects: List[Tuple[float, float, float, float]] = []
@@ -317,7 +271,6 @@ def generate_parking_map(cfg: Config) -> OccupancyMap:
     rects.append((bay_x, bay_y, bay_x + wall, bay_y + bay_h))
     rects.append((bay_x + bay_w - wall, bay_y, bay_x + bay_w, bay_y + bay_h))
     rects.append((bay_x, bay_y + bay_h - wall, bay_x + bay_w, bay_y + bay_h))
-
     for _ in range(random.randint(3, 6)):
         w = random.uniform(0.5, 1.2)
         h = random.uniform(0.5, 1.2)
@@ -330,7 +283,6 @@ def generate_parking_map(cfg: Config) -> OccupancyMap:
     meta = {"bay_x": bay_x, "bay_y": bay_y, "bay_w": bay_w, "bay_h": bay_h}
     return OccupancyMap(build_occ_from_rects(rects, cfg), compute_sdf_from_rects(rects, cfg), "parking", meta)
 
-
 def generate_map(cfg: Config) -> OccupancyMap:
     generator = random.choices(
         population=[generate_open_map, generate_clutter_map, generate_corridor_map, generate_doorway_map, generate_parking_map],
@@ -339,11 +291,7 @@ def generate_map(cfg: Config) -> OccupancyMap:
     )[0]
     return generator(cfg)
 
-
-# ============================================================
-# Start/goal sampling
-# ============================================================
-
+#Start and goal sampling here
 def sample_pose_free(omap: OccupancyMap, cfg: Config) -> Tuple[float, float, float]:
     min_clear = cfg.robot_radius + cfg.min_clearance_start_goal
     for _ in range(1000):
@@ -354,14 +302,12 @@ def sample_pose_free(omap: OccupancyMap, cfg: Config) -> Tuple[float, float, flo
             return x, y, th
     raise RuntimeError("Could not sample collision-free pose")
 
-
 def line_min_clearance(x0: np.ndarray, xg: np.ndarray, omap: OccupancyMap, cfg: Config, n: int = 72) -> float:
     ts = np.linspace(0.0, 1.0, n, dtype=np.float32)
     xs = (1.0 - ts) * x0[0] + ts * xg[0]
     ys = (1.0 - ts) * x0[1] + ts * xg[1]
     d = sdf_query_bilinear(omap.sdf, xs, ys, cfg) - cfg.robot_radius
     return float(np.min(d))
-
 
 def sample_start_goal(omap: OccupancyMap, cfg: Config) -> Tuple[np.ndarray, np.ndarray]:
     for _ in range(1000):
@@ -375,15 +321,10 @@ def sample_start_goal(omap: OccupancyMap, cfg: Config) -> Tuple[np.ndarray, np.n
         return x0, xg
     raise RuntimeError("Could not sample valid start-goal pair")
 
-
-# ============================================================
-# A* planner
-# ============================================================
-
+#A-star planner functions
 def build_astar_free_mask(omap: OccupancyMap, cfg: Config) -> np.ndarray:
     clearance = cfg.robot_radius + cfg.safety_margin
     return omap.sdf > clearance
-
 
 def astar_grid(free_mask: np.ndarray, start_xy: Tuple[int, int], goal_xy: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
     h, w = free_mask.shape
@@ -393,19 +334,16 @@ def astar_grid(free_mask: np.ndarray, start_xy: Tuple[int, int], goal_xy: Tuple[
         return None
     if not free_mask[sy, sx] or not free_mask[gy, gx]:
         return None
-
     neighbors = [
         (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
         (-1, -1, 1.41421356), (-1, 1, 1.41421356), (1, -1, 1.41421356), (1, 1, 1.41421356),
     ]
-
     def heuristic(ax: int, ay: int, bx: int, by: int) -> float:
         return math.hypot(ax - bx, ay - by)
 
     came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
     g_score: Dict[Tuple[int, int], float] = {(sx, sy): 0.0}
     heap: List[Tuple[float, int, int]] = [(heuristic(sx, sy, gx, gy), sx, sy)]
-
     while heap:
         _, cx, cy = heapq.heappop(heap)
         if cx == gx and cy == gy:
@@ -431,24 +369,18 @@ def astar_grid(free_mask: np.ndarray, start_xy: Tuple[int, int], goal_xy: Tuple[
                 heapq.heappush(heap, (f, nx, ny))
     return None
 
-
-# ============================================================
-# Path follower / rollout
-# ============================================================
-
+#Following patha and rollout functions
 def choose_lookahead_target(state_xy: np.ndarray, waypoints: np.ndarray, current_idx: int, lookahead_m: float) -> Tuple[np.ndarray, int]:
     idx = current_idx
     while idx < len(waypoints) - 1 and np.linalg.norm(waypoints[idx] - state_xy) < lookahead_m:
         idx += 1
     return waypoints[min(idx, len(waypoints) - 1)], idx
 
-
 def rollout_tracker(x0: np.ndarray, xg: np.ndarray, waypoints: np.ndarray, omap: OccupancyMap, cfg: Config) -> Tuple[np.ndarray, np.ndarray, Dict]:
     T = cfg.horizon
     controls = np.zeros((T, 2), dtype=np.float32)
     states = np.zeros((T + 1, 3), dtype=np.float32)
     states[0] = x0.astype(np.float32)
-
     wp_idx = 0
     v_prev = 0.0
     w_prev = 0.0
@@ -458,7 +390,6 @@ def rollout_tracker(x0: np.ndarray, xg: np.ndarray, waypoints: np.ndarray, omap:
         x, y, th = [float(v) for v in states[t]]
         pos = np.array([x, y], dtype=np.float32)
 
-        # Near goal: stop and align.
         goal_dx = float(xg[0] - x)
         goal_dy = float(xg[1] - y)
         goal_dist = math.hypot(goal_dx, goal_dy)
@@ -483,12 +414,10 @@ def rollout_tracker(x0: np.ndarray, xg: np.ndarray, waypoints: np.ndarray, omap:
             target_heading = math.atan2(dy, dx)
             heading_err = angle_diff(target_heading, th)
 
-            # Curvature-aware speed reduction.
             v_cmd = min(cfg.v_max, 1.0 * math.hypot(dx, dy))
             v_cmd *= max(0.25, 1.0 - 0.55 * min(abs(heading_err), 1.2))
             w_cmd = 2.4 * heading_err
 
-        # Soft accel limits.
         dv = np.clip(v_cmd - v_prev, -cfg.a_v * cfg.dt, cfg.a_v * cfg.dt)
         dw = np.clip(w_cmd - w_prev, -cfg.a_w * cfg.dt, cfg.a_w * cfg.dt)
         v = clamp(v_prev + float(dv), 0.0, cfg.v_max)
@@ -527,22 +456,16 @@ def rollout_tracker(x0: np.ndarray, xg: np.ndarray, waypoints: np.ndarray, omap:
     return controls, states, info
 
 
-# ============================================================
-# Planner wrapper
-# ============================================================
-
+#Wrapper for planner functions
 def make_plan(x0: np.ndarray, xg: np.ndarray, omap: OccupancyMap, cfg: Config) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]]:
     free_mask = build_astar_free_mask(omap, cfg)
     sx, sy = world_to_grid(float(x0[0]), float(x0[1]), cfg)
     gx, gy = world_to_grid(float(xg[0]), float(xg[1]), cfg)
-
     grid_path = astar_grid(free_mask, (sx, sy), (gx, gy))
     if grid_path is None or len(grid_path) < 2:
         return None
-
     waypoints = grid_to_world(grid_path, cfg)
     waypoints = simplify_polyline(waypoints, min_spacing=0.20)
-
     controls, states, info = rollout_tracker(x0, xg, waypoints, omap, cfg)
     success = (
         (not info["collision"]) and
@@ -553,11 +476,7 @@ def make_plan(x0: np.ndarray, xg: np.ndarray, omap: OccupancyMap, cfg: Config) -
     info["astar_num_waypoints"] = int(len(waypoints))
     return controls, states, waypoints, info
 
-
-# ============================================================
-# Serialization
-# ============================================================
-
+#Make stuff serial
 def make_sample_dict(
     omap: OccupancyMap,
     x0: np.ndarray,
@@ -584,7 +503,6 @@ def make_sample_dict(
         "map_meta": omap.meta,
     }
 
-
 def save_sample_npz(sample: Dict, path: str) -> None:
     np.savez_compressed(
         path,
@@ -602,11 +520,7 @@ def save_sample_npz(sample: Dict, path: str) -> None:
         map_meta_json=np.array(json.dumps(sample["map_meta"])),
     )
 
-
-# ============================================================
-# Generation loop
-# ============================================================
-
+#Create loop to generate
 def generate_one_sample(cfg: Config) -> Optional[Dict]:
     for _ in range(cfg.max_attempts_per_sample):
         omap = generate_map(cfg)
@@ -614,15 +528,12 @@ def generate_one_sample(cfg: Config) -> Optional[Dict]:
             x0, xg = sample_start_goal(omap, cfg)
         except RuntimeError:
             continue
-
         plan = make_plan(x0, xg, omap, cfg)
         if plan is None:
             continue
-
         controls, states, waypoints, info = plan
         if not info["success"]:
             continue
-
         return make_sample_dict(omap, x0, xg, controls, states, waypoints, cfg, info)
     return None
 
@@ -635,7 +546,6 @@ def progress_line(split: str, count: int, n_samples: int, attempts: int, last_sc
 def generate_split(n_samples: int, split_name: str, cfg: Config) -> None:
     split_dir = os.path.join(cfg.out_dir, split_name)
     os.makedirs(split_dir, exist_ok=True)
-
     count = 0
     attempts = 0
     scenario_hist: Dict[str, int] = {}
@@ -655,9 +565,7 @@ def generate_split(n_samples: int, split_name: str, cfg: Config) -> None:
         scenario_hist[sc] = scenario_hist.get(sc, 0) + 1
         count += 1
         print(progress_line(split_name, count, n_samples, attempts, sc), end="", flush=True)
-
     print()
-
     metadata = {
         "split": split_name,
         "n_samples": n_samples,
@@ -669,28 +577,19 @@ def generate_split(n_samples: int, split_name: str, cfg: Config) -> None:
     with open(os.path.join(split_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-
-# ============================================================
-# Main
-# ============================================================
-
+#Main driver part
 def main() -> None:
     cfg = Config()
     set_seed(cfg.seed)
-
     os.makedirs(cfg.out_dir, exist_ok=True)
     with open(os.path.join(cfg.out_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, indent=2)
-
     print("Generating train split...")
     generate_split(cfg.n_train, "train", cfg)
-
     print("Generating val split...")
     generate_split(cfg.n_val, "val", cfg)
-
     print("Generating test split...")
     generate_split(cfg.n_test, "test", cfg)
-
     print(f"Done. Dataset saved to: {cfg.out_dir}")
 
 

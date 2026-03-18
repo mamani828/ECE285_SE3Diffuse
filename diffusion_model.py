@@ -3,42 +3,31 @@ import os
 import glob
 import json
 from dataclasses import dataclass, asdict
+#typing helps debugging
 from typing import Dict, Optional, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
-
-# ============================================================
-# Config
-# ============================================================
-
 @dataclass
 class TrainConfig:
     data_root: str = "diffdrive_dataset"
-    map_mode: str = "sdf"                 # "sdf", "occupancy", or "sdf_occupancy"
+    map_mode: str = "sdf"          
     map_size_m: float = 10.0
-
     batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 1e-6
     epochs: int = 80
     num_workers: int = 4
-
     diffusion_steps: int = 50
     beta_start: float = 1e-4
     beta_end: float = 2e-2
-
     base_channels: int = 64
     cond_dim: int = 128
     map_emb_dim: int = 128
     pose_emb_dim: int = 64
     time_emb_dim: int = 128
-
-    # Kinodynamic auxiliary losses
     w_noise: float = 1.0
     w_state: float = 0.25
     w_terminal: float = 1.0
@@ -50,48 +39,25 @@ class TrainConfig:
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-# ============================================================
-# Utilities
-# ============================================================
-
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def wrap_angle_torch(theta: torch.Tensor) -> torch.Tensor:
     return (theta + math.pi) % (2.0 * math.pi) - math.pi
-
-
 def angle_diff_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return wrap_angle_torch(a - b)
-
-
 def load_dataset_config(data_root: str) -> Dict:
     cfg_path = os.path.join(data_root, "config.json")
     if not os.path.exists(cfg_path):
         raise FileNotFoundError(f"Missing dataset config: {cfg_path}")
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-# ============================================================
-# Dataset
-# ============================================================
-
+    
+    #diff drive dataset class to load from the other file
 class DiffDriveDataset(Dataset):
-    def __init__(
-        self,
-        root: str,
-        split: str,
-        map_mode: str,
-        map_size_m: float,
-        v_max: float,
-        w_max: float,
-        horizon: int,
-    ):
+    def __init__(self,root: str,split: str,map_mode: str, map_size_m: float,v_max: float, w_max: float,horizon: int):
         self.files = sorted(glob.glob(os.path.join(root, split, "*.npz")))
         if not self.files:
             raise FileNotFoundError(f"No .npz files found in {os.path.join(root, split)}")
@@ -101,10 +67,9 @@ class DiffDriveDataset(Dataset):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.horizon = int(horizon)
-
     def __len__(self) -> int:
         return len(self.files)
-
+    # how to condition on pose, the eight dims in the report
     def _pose_condition(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
         sx = 2.0 * (start[0] / self.map_size_m) - 1.0
         sy = 2.0 * (start[1] / self.map_size_m) - 1.0
@@ -113,23 +78,18 @@ class DiffDriveDataset(Dataset):
         sth = float(start[2])
         gth = float(goal[2])
         return np.asarray(
-            [
-                sx, sy, math.cos(sth), math.sin(sth),
-                gx, gy, math.cos(gth), math.sin(gth),
-            ],
-            dtype=np.float32,
-        )
-
+            [sx, sy, math.cos(sth), math.sin(sth),gx, gy, math.cos(gth), math.sin(gth),],dtype=np.float32,)
+    #get controls [-1,1] for both v and w
     def _normalize_controls(self, controls: np.ndarray) -> np.ndarray:
         u = controls.astype(np.float32).copy()
         u[:, 0] /= max(self.v_max, 1e-6)
         u[:, 1] /= max(self.w_max, 1e-6)
         return u
-
+    
     def _build_map_tensor(self, data: np.lib.npyio.NpzFile) -> np.ndarray:
         occ = data["occupancy"].astype(np.float32)
         sdf = data["sdf"].astype(np.float32)
-
+        # diffeent types of occupancy left for future work.
         if self.map_mode == "sdf":
             return sdf[None, ...]
         if self.map_mode == "occupancy":
@@ -138,6 +98,7 @@ class DiffDriveDataset(Dataset):
             return np.stack([sdf, 2.0 * occ - 1.0], axis=0).astype(np.float32)
         raise ValueError(f"Unsupported map_mode: {self.map_mode}")
 
+    #utils
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data = np.load(self.files[idx], allow_pickle=True)
 
@@ -163,22 +124,17 @@ class DiffDriveDataset(Dataset):
         state_mask[: valid_horizon + 1] = 1.0
 
         return {
-            "map": torch.from_numpy(map_arr),                    # (C,H,W)
-            "pose_cond": torch.from_numpy(pose_cond),            # (8,)
-            "start": torch.from_numpy(start),                    # (3,)
-            "goal": torch.from_numpy(goal),                      # (3,)
-            "controls": torch.from_numpy(controls_norm),         # (T,2)
-            "states": torch.from_numpy(states),                  # (T+1,3)
-            "control_mask": torch.from_numpy(ctrl_mask),         # (T,1)
-            "state_mask": torch.from_numpy(state_mask),          # (T+1,1)
+            "map": torch.from_numpy(map_arr),                
+            "pose_cond": torch.from_numpy(pose_cond),      
+            "start": torch.from_numpy(start),               
+            "goal": torch.from_numpy(goal),                     
+            "controls": torch.from_numpy(controls_norm),         
+            "states": torch.from_numpy(states),                  
+            "control_mask": torch.from_numpy(ctrl_mask),   
+            "state_mask": torch.from_numpy(state_mask),        
             "valid_horizon": torch.tensor(valid_horizon, dtype=torch.long),
         }
-
-
-# ============================================================
-# Diffusion schedule
-# ============================================================
-
+#diff schd
 class DiffusionSchedule(nn.Module):
     def __init__(self, num_steps: int, beta_start: float, beta_end: float):
         super().__init__()
@@ -186,7 +142,6 @@ class DiffusionSchedule(nn.Module):
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
         alpha_bars_prev = torch.cat([torch.ones(1, dtype=torch.float32), alpha_bars[:-1]], dim=0)
-
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
@@ -202,10 +157,7 @@ class DiffusionSchedule(nn.Module):
         return (xt - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
 
 
-# ============================================================
-# Embeddings / encoders
-# ============================================================
-
+#sinousoidal embeddings
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -222,7 +174,7 @@ class SinusoidalTimeEmbedding(nn.Module):
             emb = F.pad(emb, (0, 1))
         return emb
 
-
+#CNN encoder
 class MapEncoder(nn.Module):
     def __init__(self, in_ch: int, emb_dim: int):
         super().__init__()
@@ -242,7 +194,7 @@ class MapEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.net(x).flatten(1))
 
-
+# MLP encoder for pose conditioning
 class PoseEncoder(nn.Module):
     def __init__(self, in_dim: int = 8, emb_dim: int = 64):
         super().__init__()
@@ -255,10 +207,7 @@ class PoseEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-# ============================================================
-# 1D U-Net
-# ============================================================
+#residual blocks and up/down sampling for the UNet
 
 class ResBlock1D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, cond_dim: int, groups: int = 8):
@@ -295,7 +244,7 @@ class Upsample1D(nn.Module):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x)
 
-
+# main unet
 class ConditionalTemporalUNet(nn.Module):
     def __init__(
         self,
@@ -365,10 +314,7 @@ class ConditionalTemporalUNet(nn.Module):
         out = self.out_proj(F.silu(self.out_norm(u2)))
         return out.transpose(1, 2)
 
-
-# ============================================================
-# Differentiable dynamics rollout
-# ============================================================
+#denorm
 
 def denormalize_controls(u_norm: torch.Tensor, v_max: float, w_max: float) -> torch.Tensor:
     v = u_norm[..., 0] * v_max
@@ -377,10 +323,7 @@ def denormalize_controls(u_norm: torch.Tensor, v_max: float, w_max: float) -> to
 
 
 def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: float) -> torch.Tensor:
-    # start: (B,3), controls: (B,T,2)
-    # Avoid in-place writes into a tensor that is also being read through views.
     _, T, _ = controls.shape
-
     cur = start
     states = [cur]
     for k in range(T):
@@ -391,30 +334,22 @@ def rollout_unicycle_batch(start: torch.Tensor, controls: torch.Tensor, dt: floa
         w = controls[:, k, 1]
 
         nxt = torch.stack(
-            [
-                x + dt * v * torch.cos(th),
-                y + dt * v * torch.sin(th),
-                wrap_angle_torch(th + dt * w),
-            ],
-            dim=-1,
-        )
+            [x + dt * v * torch.cos(th),y + dt * v * torch.sin(th),wrap_angle_torch(th + dt * w),],dim=-1,)
         states.append(nxt)
         cur = nxt
 
     return torch.stack(states, dim=1)
 
+# all loss funcions
 
-# ============================================================
-# Losses
-# ============================================================
-
+#masked mse for noise
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     diff = (pred - target) ** 2
     diff = diff * mask
     denom = mask.sum().clamp_min(1.0) * pred.shape[-1]
     return diff.sum() / denom
 
-
+#state tracking loss, 8 dim state, but only care about x,y and theta, and also mask out invalid states
 def state_tracking_loss(pred_states: torch.Tensor, gt_states: torch.Tensor, state_mask: torch.Tensor) -> torch.Tensor:
     pos_loss = ((pred_states[..., :2] - gt_states[..., :2]) ** 2) * state_mask
     th_err = angle_diff_torch(pred_states[..., 2], gt_states[..., 2]).unsqueeze(-1)
@@ -423,7 +358,7 @@ def state_tracking_loss(pred_states: torch.Tensor, gt_states: torch.Tensor, stat
     th_term = th_loss.sum() / state_mask.sum().clamp_min(1.0)
     return pos_term + 0.25 * th_term
 
-
+# terminal loss to encourage reaching the goal, only look at the final valid state and the goal, and also mask out invalid states based on valid horizon
 def terminal_loss(pred_states: torch.Tensor, goal: torch.Tensor, valid_horizon: torch.Tensor) -> torch.Tensor:
     B = pred_states.shape[0]
     idx = valid_horizon.clamp(min=1, max=pred_states.shape[1] - 1)
@@ -434,7 +369,7 @@ def terminal_loss(pred_states: torch.Tensor, goal: torch.Tensor, valid_horizon: 
     th = torch.mean(th ** 2)
     return pos + 0.5 * th
 
-
+# smoothness loss to encourage smoother control sequences, only look at valid control steps based on control mask
 def smoothness_loss(u: torch.Tensor, control_mask: torch.Tensor) -> torch.Tensor:
     if u.shape[1] < 2:
         return torch.zeros((), device=u.device, dtype=u.dtype)
@@ -442,10 +377,7 @@ def smoothness_loss(u: torch.Tensor, control_mask: torch.Tensor) -> torch.Tensor
     mask = control_mask[:, 1:] * control_mask[:, :-1]
     return masked_mse(du, torch.zeros_like(du), mask)
 
-
-# ============================================================
-# Train / eval
-# ============================================================
+# Train
 
 def run_epoch(
     model: nn.Module,
@@ -523,10 +455,7 @@ def run_epoch(
     return {k: v / n for k, v in meters.items()}
 
 
-# ============================================================
-# DDPM sampler
-# ============================================================
-
+#DDPM
 @torch.no_grad()
 def sample_controls(
     model: nn.Module,
@@ -563,12 +492,6 @@ def sample_controls(
             x = mean
 
     return x
-
-
-# ============================================================
-# Main
-# ============================================================
-
 def main() -> None:
     cfg = TrainConfig()
     set_seed(cfg.seed)
@@ -578,12 +501,10 @@ def main() -> None:
     v_max = float(ds_cfg["v_max"])
     w_max = float(ds_cfg["w_max"])
     dt = float(ds_cfg["dt"])
-
-    if abs(cfg.map_size_m - float(ds_cfg["map_size_m"])) > 1e-6:
-        raise ValueError("TrainConfig.map_size_m does not match dataset config")
-
-    map_in_ch = 2 if cfg.map_mode == "sdf_occupancy" else 1
-
+    if cfg.map_mode == "sdf_occupancy":
+        map_in_ch = 2 
+    else:
+        map_in_ch = 1
     train_ds = DiffDriveDataset(
         root=cfg.data_root,
         split="train",
