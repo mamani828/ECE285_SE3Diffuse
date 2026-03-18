@@ -1,4 +1,4 @@
-# ECE285_SE3Diffuse
+# ECE285_Constrained_Diffusion
 
 ## Training
 
