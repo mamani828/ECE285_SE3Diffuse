@@ -24,7 +24,7 @@
   "seed": 7,
   "use_correlated_noise": true,
   "noise_corr_type": "ar1",
-  "noise_rho_train": 0.25,
+  "noise_rho_train": 0.95,
   "noise_rho_sample": 0.95,
   "device": "cuda"
 }

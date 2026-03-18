@@ -1,6 +1,6 @@
 # ECE285_SE3Diffuse
 to trian the gaussian noise model, use diffusion_model.py,
-to train correlated noise, use diffusion_model_correlated.py along with specified rho value
+to train correlated noise, use diffusion_model_correlated.py along with specified rho value. --noise_rho_train , --noise_rho_sample
 
 run_test_new_env.py returns test set using uncorrelated noise along with images.
 
