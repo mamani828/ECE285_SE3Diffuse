@@ -1,0 +1,76 @@
+{
+  "config": {
+    "data_root": "diffdrive_dataset",
+    "split": "test",
+    "map_mode": "sdf",
+    "device": "cuda",
+    "random_seed": 0,
+    "num_samples": 64,
+    "eta_clip": 1.5,
+    "project_every": 10,
+    "proj_steps": 6,
+    "proj_lr": 0.06,
+    "proj_lambda": 0.1,
+    "project_last_n_steps": 0,
+    "final_proj_steps": 0,
+    "final_proj_lr": 0.0,
+    "final_proj_lambda": 0.0,
+    "final_proj_goal_pos_scale": 0,
+    "final_proj_goal_theta_scale": 0,
+    "control_clip_norm": 1.0,
+    "proj_grad_clip_norm": 1.0,
+    "safety_margin_m": 0.05,
+    "w_goal_pos": 25.0,
+    "w_goal_theta": 2.0,
+    "w_obs": 400.0,
+    "w_ctrl": 0.001,
+    "w_smooth": 0.02,
+    "use_relaxed_success_rule": true,
+    "success_pos_extra_m": 0.1,
+    "success_theta_scale": 2.0,
+    "out_dir": "ablation_outputs",
+    "checkpoint_path_rho00": "checkpoints/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho05": "checkpoints_rho0.5/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho07": "checkpoints_rho0.7/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho08": "checkpoints_rho0.8/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho095": "checkpoints_rho0.95/diffdrive_kinodynamic_best.pt",
+    "lambda_ablation_checkpoint_path": "checkpoints/diffdrive_kinodynamic_best.pt",
+    "lambda_values": [
+      0.001,
+      0.01,
+      0.1
+    ],
+    "rho_values": [
+      0.0,
+      0.5,
+      0.7,
+      0.8,
+      0.95
+    ],
+    "project_every_values": [
+      0,
+      20,
+      10,
+      5,
+      2,
+      1
+    ]
+  },
+  "checkpoint": "checkpoints/diffdrive_kinodynamic_best.pt",
+  "matched_rho": 0.0,
+  "lambda_values": [
+    0.001,
+    0.01,
+    0.1
+  ],
+  "success_rates": [
+    30.851063829787233,
+    73.40425531914893,
+    95.74468085106383
+  ],
+  "collision_rates": [
+    17.02127659574468,
+    6.382978723404255,
+    1.0638297872340425
+  ]
+}

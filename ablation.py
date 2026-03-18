@@ -49,12 +49,6 @@ class InferConfig:
     proj_steps: int = 6
     proj_lr: float = 0.06
     proj_lambda: float = 0.1
-    project_last_n_steps: int = 0
-    final_proj_steps: int = 0
-    final_proj_lr: float = 0.03
-    final_proj_lambda: float = 0.5
-    final_proj_goal_pos_scale: float = 2.0
-    final_proj_goal_theta_scale: float = 1.5
     control_clip_norm: float = 1.0
     safety_margin_m: float = 0.05
 
@@ -509,71 +503,6 @@ def projection_objective(
     return loss, aux
 
 
-def run_projection_steps(
-    u_init: torch.Tensor,
-    u_ref: torch.Tensor,
-    start: torch.Tensor,
-    goal: torch.Tensor,
-    sdf_map: torch.Tensor,
-    dt: float,
-    v_max: float,
-    w_max: float,
-    map_size_m: float,
-    robot_radius: float,
-    safety_margin_m: float,
-    proj_steps: int,
-    proj_lr: float,
-    proj_lambda: float,
-    control_clip_norm: float,
-    w_goal_pos: float,
-    w_goal_theta: float,
-    w_obs: float,
-    w_ctrl: float,
-    w_smooth: float,
-) -> torch.Tensor:
-    if proj_steps <= 0:
-        return u_init.detach()
-
-    u_proj = u_init.detach().clone().requires_grad_(True)
-    opt = torch.optim.Adam([u_proj], lr=proj_lr)
-
-    for proj_step in range(proj_steps):
-        opt.zero_grad(set_to_none=True)
-
-        loss, _ = projection_objective(
-            u_norm=u_proj,
-            u_ref=u_ref,
-            start=start,
-            goal=goal,
-            sdf_map=sdf_map,
-            dt=dt,
-            v_max=v_max,
-            w_max=w_max,
-            map_size_m=map_size_m,
-            robot_radius=robot_radius,
-            safety_margin_m=safety_margin_m,
-            proj_lambda=proj_lambda,
-            w_goal_pos=w_goal_pos,
-            w_goal_theta=w_goal_theta,
-            w_obs=w_obs,
-            w_ctrl=w_ctrl,
-            w_smooth=w_smooth,
-        )
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_([u_proj], max_norm=1.0)
-        opt.step()
-
-        decay = 0.5 * (1.0 + math.cos(math.pi * float(proj_step + 1) / float(proj_steps)))
-        for group in opt.param_groups:
-            group["lr"] = max(1e-4, proj_lr * decay)
-
-        with torch.no_grad():
-            u_proj.clamp_(-control_clip_norm, control_clip_norm)
-
-    return u_proj.detach()
-
-
 # ============================================================
 # Diffusion sampler
 # ============================================================
@@ -599,12 +528,6 @@ def sample_controls(
     proj_steps: int = 6,
     proj_lr: float = 0.06,
     proj_lambda: float = 0.1,
-    project_last_n_steps: int = 8,
-    final_proj_steps: int = 24,
-    final_proj_lr: float = 0.03,
-    final_proj_lambda: float = 0.5,
-    final_proj_goal_pos_scale: float = 2.0,
-    final_proj_goal_theta_scale: float = 1.5,
     control_clip_norm: float = 1.0,
     safety_margin_m: float = 0.05,
     w_goal_pos: float = 25.0,
@@ -640,60 +563,44 @@ def sample_controls(
                 u_tilde = mean
 
         k = step + 1
-        do_project = use_projection and (
-            ((project_every > 0) and (k % project_every == 0))
-            or ((project_last_n_steps > 0) and (k <= project_last_n_steps))
-        )
+        do_project = use_projection and (project_every > 0) and (k % project_every == 0)
 
         if do_project:
-            x = run_projection_steps(
-                u_init=u_tilde,
-                u_ref=u_tilde.detach(),
-                start=start_tensor,
-                goal=goal_tensor,
-                sdf_map=sdf_map,
-                dt=dt,
-                v_max=v_max,
-                w_max=w_max,
-                map_size_m=map_size_m,
-                robot_radius=robot_radius,
-                safety_margin_m=safety_margin_m,
-                proj_steps=proj_steps,
-                proj_lr=proj_lr,
-                proj_lambda=proj_lambda,
-                control_clip_norm=control_clip_norm,
-                w_goal_pos=w_goal_pos,
-                w_goal_theta=w_goal_theta,
-                w_obs=w_obs,
-                w_ctrl=w_ctrl,
-                w_smooth=w_smooth,
-            )
+            u_proj = u_tilde.detach().clone().requires_grad_(True)
+            opt = torch.optim.Adam([u_proj], lr=proj_lr)
+
+            for _ in range(proj_steps):
+                opt.zero_grad(set_to_none=True)
+
+                loss, _ = projection_objective(
+                    u_norm=u_proj,
+                    u_ref=u_tilde.detach(),
+                    start=start_tensor,
+                    goal=goal_tensor,
+                    sdf_map=sdf_map,
+                    dt=dt,
+                    v_max=v_max,
+                    w_max=w_max,
+                    map_size_m=map_size_m,
+                    robot_radius=robot_radius,
+                    safety_margin_m=safety_margin_m,
+                    proj_lambda=proj_lambda,
+                    w_goal_pos=w_goal_pos,
+                    w_goal_theta=w_goal_theta,
+                    w_obs=w_obs,
+                    w_ctrl=w_ctrl,
+                    w_smooth=w_smooth,
+                )
+
+                loss.backward()
+                opt.step()
+
+                with torch.no_grad():
+                    u_proj.clamp_(-control_clip_norm, control_clip_norm)
+
+            x = u_proj.detach()
         else:
             x = u_tilde.detach()
-
-    if use_projection and final_proj_steps > 0:
-        x = run_projection_steps(
-            u_init=x,
-            u_ref=x.detach(),
-            start=start_tensor,
-            goal=goal_tensor,
-            sdf_map=sdf_map,
-            dt=dt,
-            v_max=v_max,
-            w_max=w_max,
-            map_size_m=map_size_m,
-            robot_radius=robot_radius,
-            safety_margin_m=safety_margin_m,
-            proj_steps=final_proj_steps,
-            proj_lr=final_proj_lr,
-            proj_lambda=final_proj_lambda,
-            control_clip_norm=control_clip_norm,
-            w_goal_pos=w_goal_pos * final_proj_goal_pos_scale,
-            w_goal_theta=w_goal_theta * final_proj_goal_theta_scale,
-            w_obs=w_obs,
-            w_ctrl=w_ctrl,
-            w_smooth=w_smooth,
-        )
 
     return x
 
@@ -1198,12 +1105,6 @@ def run_method_on_case(
             proj_steps=cfg.proj_steps,
             proj_lr=cfg.proj_lr,
             proj_lambda=cfg.proj_lambda,
-            project_last_n_steps=cfg.project_last_n_steps,
-            final_proj_steps=cfg.final_proj_steps,
-            final_proj_lr=cfg.final_proj_lr,
-            final_proj_lambda=cfg.final_proj_lambda,
-            final_proj_goal_pos_scale=cfg.final_proj_goal_pos_scale,
-            final_proj_goal_theta_scale=cfg.final_proj_goal_theta_scale,
             control_clip_norm=cfg.control_clip_norm,
             safety_margin_m=cfg.safety_margin_m,
             w_goal_pos=cfg.w_goal_pos,
@@ -1313,7 +1214,6 @@ def run_method_on_case(
 
 def main() -> None:
     cfg = InferConfig()
-    cfg.device = "cuda" 
     os.makedirs(cfg.out_dir, exist_ok=True)
     set_seed(cfg.random_seed)
 
@@ -1496,5 +1396,470 @@ def main() -> None:
     print(f"\nSaved summary to: {summary_path}")
 
 
+# ============================================================
+# AR-1 correlated noise sampler (used in temporal-correlation ablation)
+# ============================================================
+
+def ar1_initial_noise(B: int, horizon: int, control_dim: int, rho: float, device: str) -> torch.Tensor:
+    """
+    Generate an (B, horizon, control_dim) noise tensor whose time-axis
+    follows an AR(1) process with correlation coefficient rho.
+
+    x_0 ~ N(0, I)
+    x_t = rho * x_{t-1} + sqrt(1 - rho^2) * eps_t,   eps_t ~ N(0, I)
+
+    When rho=0 this reduces to plain i.i.d. Gaussian noise.
+    """
+    x = torch.zeros(B, horizon, control_dim, device=device)
+    x[:, 0, :] = torch.randn(B, control_dim, device=device)
+    innov_scale = math.sqrt(max(1.0 - rho * rho, 0.0))
+    for t in range(1, horizon):
+        x[:, t, :] = rho * x[:, t - 1, :] + innov_scale * torch.randn(B, control_dim, device=device)
+    return x
+
+
+def sample_controls_ar1(
+    model: nn.Module,
+    schedule: DiffusionSchedule,
+    map_tensor: torch.Tensor,
+    pose_cond: torch.Tensor,
+    horizon: int,
+    control_dim: int,
+    device: str,
+    start_tensor: torch.Tensor,
+    goal_tensor: torch.Tensor,
+    sdf_map: torch.Tensor,
+    dt: float,
+    v_max: float,
+    w_max: float,
+    map_size_m: float,
+    robot_radius: float,
+    rho: float = 0.0,
+    use_projection: bool = True,
+    project_every: int = 10,
+    proj_steps: int = 6,
+    proj_lr: float = 0.06,
+    proj_lambda: float = 0.1,
+    control_clip_norm: float = 1.0,
+    safety_margin_m: float = 0.05,
+    w_goal_pos: float = 25.0,
+    w_goal_theta: float = 2.0,
+    w_obs: float = 400.0,
+    w_ctrl: float = 1e-3,
+    w_smooth: float = 0.02,
+    eta_clip: float = 1.5,
+) -> torch.Tensor:
+    """
+    Identical to sample_controls but starts from AR(1)-correlated noise
+    (controlled by rho along the horizon/time dimension) rather than i.i.d.
+    Gaussian noise.  project_every=0 disables projection entirely.
+    """
+    B = map_tensor.shape[0]
+    x = ar1_initial_noise(B, horizon, control_dim, rho=rho, device=device)
+
+    for step in reversed(range(schedule.num_steps)):
+        with torch.no_grad():
+            t = torch.full((B,), step, device=device, dtype=torch.long)
+            pred_noise = model(x, t, map_tensor, pose_cond)
+
+            alpha_t       = schedule.alphas[t].view(-1, 1, 1)
+            alpha_bar_t   = schedule.alpha_bars[t].view(-1, 1, 1)
+            beta_t        = schedule.betas[t].view(-1, 1, 1)
+            alpha_bar_prev = schedule.alpha_bars_prev[t].view(-1, 1, 1)
+
+            x0_hat = schedule.predict_x0_from_noise(x, t, pred_noise).clamp(-eta_clip, eta_clip)
+            coef1  = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
+            coef2  = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+            mean   = coef1 * x0_hat + coef2 * x
+
+            if step > 0:
+                posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+                u_tilde = mean + torch.sqrt(posterior_var.clamp_min(1e-8)) * torch.randn_like(x)
+            else:
+                u_tilde = mean
+
+        k = step + 1
+        do_project = use_projection and (project_every > 0) and (k % project_every == 0)
+
+        if do_project:
+            u_proj = u_tilde.detach().clone().requires_grad_(True)
+            opt = torch.optim.Adam([u_proj], lr=proj_lr)
+            for _ in range(proj_steps):
+                opt.zero_grad(set_to_none=True)
+                loss, _ = projection_objective(
+                    u_norm=u_proj,
+                    u_ref=u_tilde.detach(),
+                    start=start_tensor,
+                    goal=goal_tensor,
+                    sdf_map=sdf_map,
+                    dt=dt,
+                    v_max=v_max,
+                    w_max=w_max,
+                    map_size_m=map_size_m,
+                    robot_radius=robot_radius,
+                    safety_margin_m=safety_margin_m,
+                    proj_lambda=proj_lambda,
+                    w_goal_pos=w_goal_pos,
+                    w_goal_theta=w_goal_theta,
+                    w_obs=w_obs,
+                    w_ctrl=w_ctrl,
+                    w_smooth=w_smooth,
+                )
+                loss.backward()
+                opt.step()
+                with torch.no_grad():
+                    u_proj.clamp_(-control_clip_norm, control_clip_norm)
+            x = u_proj.detach()
+        else:
+            x = u_tilde.detach()
+
+    return x
+
+
+# ============================================================
+# Ablation 1: Effect of projection lambda on success / collision
+# ============================================================
+
+def run_ablation_lambda(
+    cfg: InferConfig,
+    model: nn.Module,
+    schedule: DiffusionSchedule,
+    ds_cfg: Dict,
+    files: List[str],
+    lambda_values: Optional[List[float]] = None,
+    num_samples: int = 32,
+    out_dir: str = "ablation_outputs",
+) -> None:
+    """
+    For each value of proj_lambda, run diffusion_projected on every test file
+    and record success / collision rates.  Produces a log-x-axis line plot.
+    """
+    if lambda_values is None:
+        lambda_values = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0]
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    horizon     = int(ds_cfg["horizon"])
+    dt          = float(ds_cfg["dt"])
+    v_max       = float(ds_cfg["v_max"])
+    w_max       = float(ds_cfg["w_max"])
+    map_size_m  = float(ds_cfg["map_size_m"])
+    robot_radius  = float(ds_cfg["robot_radius"])
+    goal_pos_tol  = float(ds_cfg["goal_pos_tol"])
+    goal_theta_tol_deg = float(ds_cfg["goal_theta_tol_deg"])
+    map_in_ch   = 2 if cfg.map_mode == "sdf_occupancy" else 1
+
+    success_rates  = []
+    collision_rates = []
+
+    for lam in lambda_values:
+        print(f"  lambda={lam:.4g} ...", end=" ", flush=True)
+        successes  = []
+        collisions = []
+
+        for sample_path in files:
+            data = np.load(sample_path, allow_pickle=True)
+            map_arr   = build_map_tensor(data, cfg.map_mode)
+            sdf_np    = data["sdf"].astype(np.float32)
+            start_np  = data["start"].astype(np.float32)
+            goal_np   = data["goal"].astype(np.float32)
+            pcond_np  = pose_condition(start_np, goal_np, map_size_m)
+
+            map_tensor  = torch.from_numpy(map_arr).unsqueeze(0).repeat(num_samples, 1, 1, 1).to(cfg.device)
+            pose_tensor = torch.from_numpy(pcond_np).unsqueeze(0).repeat(num_samples, 1).to(cfg.device)
+            start_t     = torch.from_numpy(start_np).unsqueeze(0).repeat(num_samples, 1).to(cfg.device)
+            goal_t      = torch.from_numpy(goal_np).unsqueeze(0).repeat(num_samples, 1).to(cfg.device)
+            sdf_t       = torch.from_numpy(sdf_np).to(cfg.device)
+
+            u_norm = sample_controls(
+                model=model, schedule=schedule,
+                map_tensor=map_tensor, pose_cond=pose_tensor,
+                horizon=horizon, control_dim=2, device=cfg.device,
+                start_tensor=start_t, goal_tensor=goal_t, sdf_map=sdf_t,
+                dt=dt, v_max=v_max, w_max=w_max,
+                map_size_m=map_size_m, robot_radius=robot_radius,
+                use_projection=True,
+                project_every=cfg.project_every,
+                proj_steps=cfg.proj_steps,
+                proj_lr=cfg.proj_lr,
+                proj_lambda=lam,
+                control_clip_norm=cfg.control_clip_norm,
+                safety_margin_m=cfg.safety_margin_m,
+                w_goal_pos=cfg.w_goal_pos, w_goal_theta=cfg.w_goal_theta,
+                w_obs=cfg.w_obs, w_ctrl=cfg.w_ctrl, w_smooth=cfg.w_smooth,
+                eta_clip=cfg.eta_clip,
+            )
+            controls = denormalize_controls(u_norm, v_max=v_max, w_max=w_max)
+            states   = rollout_unicycle_batch(start_t, controls, dt=dt)
+            metrics  = evaluate_rollouts(
+                states=states, goal=goal_t, sdf_map=sdf_t,
+                robot_radius=robot_radius,
+                goal_pos_tol=goal_pos_tol,
+                goal_theta_tol_deg=goal_theta_tol_deg,
+                map_size_m=map_size_m,
+            )
+            best_idx  = best_index_from_metrics(metrics)
+            successes.append(float(metrics["success"][best_idx]))
+            collisions.append(float(metrics["collision"][best_idx]))
+
+        sr = 100.0 * float(np.mean(successes))
+        cr = 100.0 * float(np.mean(collisions))
+        success_rates.append(sr)
+        collision_rates.append(cr)
+        print(f"success={sr:.1f}%  collision={cr:.1f}%")
+
+    # ── Save raw results ──────────────────────────────────────────────────────
+    results = {
+        "lambda_values":    lambda_values,
+        "success_rates":    success_rates,
+        "collision_rates":  collision_rates,
+    }
+    with open(os.path.join(out_dir, "ablation_lambda.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(lambda_values, success_rates,  marker="o", linewidth=2,
+            color="tab:green", label="Success Rate")
+    ax.plot(lambda_values, collision_rates, marker="s", linewidth=2,
+            color="tab:red",   label="Collision Rate")
+    ax.set_xscale("log")
+    ax.set_xlabel(r"Lambda ($\lambda$)")
+    ax.set_ylabel("Rate (%)")
+    ax.set_title("Ablation: Effect of Lambda on Performance")
+    ax.legend()
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    plot_path = os.path.join(out_dir, "ablation_lambda.png")
+    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Lambda ablation plot saved to: {plot_path}")
+
+
+# ============================================================
+# Ablation 2: AR-1 temporal correlation × projection frequency
+# ============================================================
+
+def run_ablation_ar1_projection(
+    cfg: InferConfig,
+    model: nn.Module,
+    schedule: DiffusionSchedule,
+    ds_cfg: Dict,
+    files: List[str],
+    rho_values: Optional[List[float]] = None,
+    project_every_values: Optional[List[int]] = None,
+    num_samples: int = 32,
+    out_dir: str = "ablation_outputs",
+) -> None:
+    """
+    Grid sweep over AR(1) noise correlation (rho) and projection frequency
+    (project_every).  project_every=0 means no projection.
+
+    Produces one line per rho value; x-axis is projection frequency
+    (displayed in decreasing order: none → 20 → 10 → 5 → 2 → 1).
+    """
+    if rho_values is None:
+        rho_values = [0.0, 0.8, 0.95]
+    if project_every_values is None:
+        # 0 encodes "no projection"; others are every-N-steps values
+        project_every_values = [0, 20, 10, 5, 2, 1]
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    horizon     = int(ds_cfg["horizon"])
+    dt          = float(ds_cfg["dt"])
+    v_max       = float(ds_cfg["v_max"])
+    w_max       = float(ds_cfg["w_max"])
+    map_size_m  = float(ds_cfg["map_size_m"])
+    robot_radius  = float(ds_cfg["robot_radius"])
+    goal_pos_tol  = float(ds_cfg["goal_pos_tol"])
+    goal_theta_tol_deg = float(ds_cfg["goal_theta_tol_deg"])
+
+    # results[rho][proj_every] = success_rate_pct
+    all_results: Dict[float, Dict[int, float]] = {}
+
+    for rho in rho_values:
+        all_results[rho] = {}
+        for pe in project_every_values:
+            use_proj = (pe > 0)
+            label    = f"rho={rho}  proj_every={'none' if pe == 0 else pe}"
+            print(f"  {label} ...", end=" ", flush=True)
+
+            successes = []
+            for sample_path in files:
+                data = np.load(sample_path, allow_pickle=True)
+                map_arr   = build_map_tensor(data, cfg.map_mode)
+                sdf_np    = data["sdf"].astype(np.float32)
+                start_np  = data["start"].astype(np.float32)
+                goal_np   = data["goal"].astype(np.float32)
+                pcond_np  = pose_condition(start_np, goal_np, map_size_m)
+
+                map_tensor  = torch.from_numpy(map_arr).unsqueeze(0).repeat(num_samples, 1, 1, 1).to(cfg.device)
+                pose_tensor = torch.from_numpy(pcond_np).unsqueeze(0).repeat(num_samples, 1).to(cfg.device)
+                start_t     = torch.from_numpy(start_np).unsqueeze(0).repeat(num_samples, 1).to(cfg.device)
+                goal_t      = torch.from_numpy(goal_np).unsqueeze(0).repeat(num_samples, 1).to(cfg.device)
+                sdf_t       = torch.from_numpy(sdf_np).to(cfg.device)
+
+                u_norm = sample_controls_ar1(
+                    model=model, schedule=schedule,
+                    map_tensor=map_tensor, pose_cond=pose_tensor,
+                    horizon=horizon, control_dim=2, device=cfg.device,
+                    start_tensor=start_t, goal_tensor=goal_t, sdf_map=sdf_t,
+                    dt=dt, v_max=v_max, w_max=w_max,
+                    map_size_m=map_size_m, robot_radius=robot_radius,
+                    rho=rho,
+                    use_projection=use_proj,
+                    project_every=pe,
+                    proj_steps=cfg.proj_steps,
+                    proj_lr=cfg.proj_lr,
+                    proj_lambda=cfg.proj_lambda,
+                    control_clip_norm=cfg.control_clip_norm,
+                    safety_margin_m=cfg.safety_margin_m,
+                    w_goal_pos=cfg.w_goal_pos, w_goal_theta=cfg.w_goal_theta,
+                    w_obs=cfg.w_obs, w_ctrl=cfg.w_ctrl, w_smooth=cfg.w_smooth,
+                    eta_clip=cfg.eta_clip,
+                )
+                controls = denormalize_controls(u_norm, v_max=v_max, w_max=w_max)
+                states   = rollout_unicycle_batch(start_t, controls, dt=dt)
+                metrics  = evaluate_rollouts(
+                    states=states, goal=goal_t, sdf_map=sdf_t,
+                    robot_radius=robot_radius,
+                    goal_pos_tol=goal_pos_tol,
+                    goal_theta_tol_deg=goal_theta_tol_deg,
+                    map_size_m=map_size_m,
+                )
+                best_idx = best_index_from_metrics(metrics)
+                successes.append(float(metrics["success"][best_idx]))
+
+            sr = 100.0 * float(np.mean(successes))
+            all_results[rho][pe] = sr
+            print(f"success={sr:.1f}%")
+
+    # ── Save raw results ──────────────────────────────────────────────────────
+    serialisable = {str(rho): {str(pe): v for pe, v in d.items()}
+                    for rho, d in all_results.items()}
+    with open(os.path.join(out_dir, "ablation_ar1_projection.json"), "w", encoding="utf-8") as f:
+        json.dump({"rho_values": rho_values,
+                   "project_every_values": project_every_values,
+                   "results": serialisable}, f, indent=2)
+
+    # ── Build x-axis tick labels (none → large-to-small N values) ────────────
+    # Display order: no-projection first, then decreasing frequency (1 = most frequent)
+    x_labels = ["none" if pe == 0 else str(pe) for pe in project_every_values]
+    x_pos    = list(range(len(project_every_values)))
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors  = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
+    markers = ["o", "s", "^", "D", "v"]
+
+    for i, rho in enumerate(rho_values):
+        y_vals = [all_results[rho][pe] for pe in project_every_values]
+        ax.plot(
+            x_pos, y_vals,
+            marker=markers[i % len(markers)],
+            color=colors[i % len(colors)],
+            linewidth=2,
+            label=f"rho={rho}",
+        )
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("Projection frequency (every N diffusion steps)")
+    ax.set_ylabel("Success rate (%)")
+    ax.set_title("Ablation: Temporal correlation vs projection frequency")
+    ax.set_ylim(0, 105)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    plot_path = os.path.join(out_dir, "ablation_ar1_projection.png")
+    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  AR-1 × projection-frequency ablation plot saved to: {plot_path}")
+
+
+# ============================================================
+# Ablation entry-point
+# ============================================================
+
+def run_ablations() -> None:
+    """
+    Standalone runner for both ablation studies.
+    Loads the same checkpoint as main() and evaluates on the full test split.
+    Edit the lists below to change the sweep ranges.
+    """
+    cfg = InferConfig()
+    os.makedirs(cfg.out_dir, exist_ok=True)
+
+    ckpt = torch.load(cfg.checkpoint_path, map_location=cfg.device)
+    train_cfg   = ckpt["train_cfg"]
+    ds_cfg      = ckpt["dataset_cfg"]
+
+    if cfg.map_mode != train_cfg["map_mode"]:
+        print(
+            f"[warning] infer map_mode={cfg.map_mode} differs from "
+            f"train map_mode={train_cfg['map_mode']}. Using infer setting."
+        )
+
+    map_in_ch = 2 if cfg.map_mode == "sdf_occupancy" else 1
+
+    model = ConditionalTemporalUNet(
+        control_dim=2,
+        map_in_ch=map_in_ch,
+        base_channels=int(train_cfg["base_channels"]),
+        cond_dim=int(train_cfg["cond_dim"]),
+        time_emb_dim=int(train_cfg["time_emb_dim"]),
+        pose_emb_dim=int(train_cfg["pose_emb_dim"]),
+        map_emb_dim=int(train_cfg["map_emb_dim"]),
+    ).to(cfg.device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    schedule = DiffusionSchedule(
+        num_steps=int(train_cfg["diffusion_steps"]),
+        beta_start=float(train_cfg["beta_start"]),
+        beta_end=float(train_cfg["beta_end"]),
+    ).to(cfg.device)
+    schedule.load_state_dict(ckpt["schedule"])
+    schedule.eval()
+
+    files = sorted(glob.glob(os.path.join(cfg.data_root, "test", "*.npz")))
+    if not files:
+        raise FileNotFoundError(
+            f"No .npz files found in {os.path.join(cfg.data_root, 'test')}"
+        )
+
+    ablation_out = "ablation_outputs"
+    num_samples  = cfg.num_samples   # reuse InferConfig setting
+
+    # ── Ablation 1: lambda sweep ──────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Ablation 1: Effect of proj_lambda on success / collision rate")
+    print("=" * 60)
+    run_ablation_lambda(
+        cfg=cfg, model=model, schedule=schedule,
+        ds_cfg=ds_cfg, files=files,
+        lambda_values=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
+        num_samples=num_samples,
+        out_dir=ablation_out,
+    )
+
+    # ── Ablation 2: AR-1 rho × projection frequency ───────────────────────────
+    print("\n" + "=" * 60)
+    print("Ablation 2: AR-1 temporal correlation × projection frequency")
+    print("=" * 60)
+    run_ablation_ar1_projection(
+        cfg=cfg, model=model, schedule=schedule,
+        ds_cfg=ds_cfg, files=files,
+        rho_values=[0.0, 0.8, 0.95],
+        project_every_values=[0, 20, 10, 5, 2, 1],
+        num_samples=num_samples,
+        out_dir=ablation_out,
+    )
+
+    print("\nAll ablations complete.")
+
+
 if __name__ == "__main__":
-    main()
+        run_ablations()
+       # main()

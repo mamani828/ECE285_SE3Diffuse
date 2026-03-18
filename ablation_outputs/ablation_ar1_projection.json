@@ -1,0 +1,116 @@
+{
+  "config": {
+    "data_root": "diffdrive_dataset",
+    "split": "test",
+    "map_mode": "sdf",
+    "device": "cuda",
+    "random_seed": 0,
+    "num_samples": 64,
+    "eta_clip": 1.5,
+    "project_every": 10,
+    "proj_steps": 6,
+    "proj_lr": 0.06,
+    "proj_lambda": 0.1,
+    "project_last_n_steps": 0,
+    "final_proj_steps": 0,
+    "final_proj_lr": 0.0,
+    "final_proj_lambda": 0.0,
+    "final_proj_goal_pos_scale": 0,
+    "final_proj_goal_theta_scale": 0,
+    "control_clip_norm": 1.0,
+    "proj_grad_clip_norm": 1.0,
+    "safety_margin_m": 0.05,
+    "w_goal_pos": 25.0,
+    "w_goal_theta": 2.0,
+    "w_obs": 400.0,
+    "w_ctrl": 0.001,
+    "w_smooth": 0.02,
+    "use_relaxed_success_rule": true,
+    "success_pos_extra_m": 0.1,
+    "success_theta_scale": 2.0,
+    "out_dir": "ablation_outputs",
+    "checkpoint_path_rho00": "checkpoints/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho05": "checkpoints_rho0.5/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho07": "checkpoints_rho0.7/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho08": "checkpoints_rho0.8/diffdrive_kinodynamic_best.pt",
+    "checkpoint_path_rho095": "checkpoints_rho0.95/diffdrive_kinodynamic_best.pt",
+    "lambda_ablation_checkpoint_path": "checkpoints/diffdrive_kinodynamic_best.pt",
+    "lambda_values": [
+      0.001,
+      0.01,
+      0.1
+    ],
+    "rho_values": [
+      0.0,
+      0.5,
+      0.7,
+      0.8,
+      0.95
+    ],
+    "project_every_values": [
+      0,
+      20,
+      10,
+      5,
+      2,
+      1
+    ]
+  },
+  "rho_values": [
+    0.0,
+    0.5,
+    0.7,
+    0.8,
+    0.95
+  ],
+  "project_every_values": [
+    0,
+    20,
+    10,
+    5,
+    2,
+    1
+  ],
+  "results": {
+    "0.0": {
+      "0": 34.04255319148936,
+      "20": 71.27659574468085,
+      "10": 88.29787234042553,
+      "5": 100.0,
+      "2": 97.87234042553192,
+      "1": 100.0
+    },
+    "0.5": {
+      "0": 54.25531914893617,
+      "20": 62.76595744680851,
+      "10": 79.7872340425532,
+      "5": 96.80851063829788,
+      "2": 100.0,
+      "1": 100.0
+    },
+    "0.7": {
+      "0": 70.2127659574468,
+      "20": 75.53191489361703,
+      "10": 90.42553191489363,
+      "5": 98.93617021276596,
+      "2": 100.0,
+      "1": 98.93617021276596
+    },
+    "0.8": {
+      "0": 64.8936170212766,
+      "20": 62.76595744680851,
+      "10": 76.59574468085107,
+      "5": 94.68085106382979,
+      "2": 98.93617021276596,
+      "1": 100.0
+    },
+    "0.95": {
+      "0": 45.744680851063826,
+      "20": 59.57446808510638,
+      "10": 59.57446808510638,
+      "5": 77.6595744680851,
+      "2": 97.87234042553192,
+      "1": 98.93617021276596
+    }
+  }
+}
